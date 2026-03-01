@@ -95,10 +95,10 @@ static void iceing(int amount) {
 
 /* catching signals */
 static void on_number_confirmed(int n) {
-    printf("Zahl bestätigt: %d\n", n);
+    printf("Input: %d\n", n);
     fflush(stdout);
     if (n == 1) {
-        printf("Zahl 1 True\n");
+        printf("Function called: %d\n", n);
         /*fflush(stdout);*/
         brighten(30);
     }
