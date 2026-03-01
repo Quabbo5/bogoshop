@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/admin/codespace/numpho fetch origin)",
+      "Bash(git -C /Users/admin/codespace/numpho log --oneline --graph origin/main master)"
+    ]
+  }
+}
