@@ -1,0 +1,37 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build",
+            "type": "shell",
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": ["$gcc"],
+            "windows": {
+                "command": "C:/msys64/mingw64/bin/gcc.exe",
+                "args": [
+                    "-DSDL_MAIN_HANDLED",
+                    "viewer.c",
+                    "-o", "viewer.exe",
+                    "-g", "-O0",
+                    "-I", "C:/msys64/mingw64/include",
+                    "-L", "C:/msys64/mingw64/lib",
+                    "-lSDL2",
+                    "-mconsole"
+                ]
+            },
+            "osx": {
+                "command": "gcc",
+                "args": [
+                    "viewer.c",
+                    "-o", "viewer",
+                    "-g", "-O0",
+                    "-I/opt/homebrew/include",
+                    "-I/usr/local/include",
+                    "-L/opt/homebrew/lib",
+                    "-L/usr/local/lib",
+                    "-lSDL2"
+                ]
+            }
+        }
+    ]
+}

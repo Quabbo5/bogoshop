@@ -1,0 +1,37 @@
+{
+    "configurations": [
+        {
+            "name": "Windows (MinGW)",
+            "intelliSenseMode": "gcc-x64",
+            "compilerPath": "C:/msys64/mingw64/bin/gcc.exe",
+            "includePath": [
+                "${workspaceFolder}",
+                "C:/msys64/mingw64/include",
+                "C:/msys64/mingw64/include/SDL2"
+            ],
+            "defines": [
+                "STB_IMAGE_IMPLEMENTATION",
+                "STB_EASY_FONT_IMPLEMENTATION"
+            ],
+            "cStandard": "c11"
+        },
+        {
+            "name": "Mac",
+            "intelliSenseMode": "gcc-x64",
+            "compilerPath": "/usr/bin/gcc",
+            "includePath": [
+                "${workspaceFolder}",
+                "/opt/homebrew/include",
+                "/opt/homebrew/include/SDL2",
+                "/usr/local/include",
+                "/usr/local/include/SDL2"
+            ],
+            "defines": [
+                "STB_IMAGE_IMPLEMENTATION",
+                "STB_EASY_FONT_IMPLEMENTATION"
+            ],
+            "cStandard": "c11"
+        }
+    ],
+    "version": 4
+}
