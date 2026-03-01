@@ -44,7 +44,7 @@ static void reset_image(void) {
 /* ── U: Letzten Schritt rückgängig machen ────────────────────────────── */
 static void undo_last(void) {
     if (ctx.undo_count == 0) {
-        printf("Kein Undo mehr verfügbar\n"); fflush(stdout);
+        printf("No more undos for you\n"); fflush(stdout);
         return;
     }
     int total_bytes = ctx.w * ctx.h * 4;
@@ -52,7 +52,7 @@ static void undo_last(void) {
     ctx.undo_count--;
     memcpy(ctx.pixels, ctx.undo_stack[ctx.undo_head], total_bytes);
     SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
-    printf("Undo (%d/%d verbleibend)\n", ctx.undo_count, UNDO_HISTORY); fflush(stdout);
+    printf("Undo (%d/%d left)\n", ctx.undo_count, UNDO_HISTORY); fflush(stdout);
 }
 
 /* ── Bild um 'amount' aufhellen (0–255) und Textur aktualisieren ─────── */
@@ -92,30 +92,89 @@ static void iceing(int amount) {
     SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
 }
 
-
-/* catching signals */
-static void on_number_confirmed(int n) {
-    printf("Input: %d\n", n);
-    fflush(stdout);
-    if (n == 1) {
-        printf("Function called: %d\n", n);
-        /*fflush(stdout);*/
-        brighten(30);
+static void my_new_function(int amount) {
+    save_undo_state();
+    int total_bytes = ctx.w * ctx.h * 4;
+    for (int byte_index = 0; byte_index < total_bytes; byte_index++) {
+        if (byte_index % 4 == 3) continue;
+        int neuer_wert = ctx.pixels[byte_index] - amount;
+        ctx.pixels[byte_index] = neuer_wert > 255 ? 255 : (unsigned char)neuer_wert;
     }
-    if (n == 2) {
-        printf("Zahl 2 True\n");
-        darken(30);
-    }
-    if (n == 3) {
-        printf("Zahl 3 True\n");
-        iceing(30);
-    }
-    else{
-        printf("No function found dumbass hahahhaha\n");
-    }
+    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
 }
 
-/* Render top texts */
+static void negative(int amount){
+    save_undo_state();
+    int total_bytes = ctx.w * ctx.h * 4;
+    for (int byte_index = 0; byte_index < total_bytes; byte_index++) {
+        if (byte_index % 4 == 3) continue;
+        ctx.pixels[byte_index] = 255 - ctx.pixels[byte_index];
+    }
+    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
+}
+
+static void kachel_function(int amount) {
+    save_undo_state();
+    int w = ctx.w, h = ctx.h;
+    int tile_w = w / 2;
+    int tile_h = h / 2;
+
+    /* Temporäre Kopie zum Lesen – sonst überschreiben wir Quellpixel die wir noch brauchen */
+    unsigned char *tmp = malloc(w * h * 4);
+    memcpy(tmp, ctx.pixels, w * h * 4);
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            /* Position innerhalb der Kachel → zurück auf Vollbild-Koordinaten skalieren */
+            int sx = (x % tile_w) * 2;
+            int sy = (y % tile_h) * 2;
+            if (sx >= w) sx = w - 1;
+            if (sy >= h) sy = h - 1;
+
+            int dst = (y * w + x) * 4;
+            int src = (sy * w + sx) * 4;
+            ctx.pixels[dst + 0] = tmp[src + 0];
+            ctx.pixels[dst + 1] = tmp[src + 1];
+            ctx.pixels[dst + 2] = tmp[src + 2];
+            ctx.pixels[dst + 3] = tmp[src + 3];
+        }
+    }
+
+    free(tmp);
+    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
+}
+
+/* ── Effect-Tabelle: ID → Funktion → Amount → Name ───────────────────── */
+static const struct {
+    int         id;
+    void      (*fn)(int);
+    int         amount;
+    const char *name;
+} effects[] = {
+    { 1, brighten,        30, "Brighten"  },
+    { 2, darken,          30, "Darken"    },
+    { 3, iceing,          30, "Iceing"    },
+    { 4, my_new_function, 30, "MyFunc"    },
+    { 5, negative,         0, "Negative"  },
+    { 6, kachel_function,  0, "Kachel"    },
+
+};
+
+/* catching signals – gibt den Effektnamen zurück, NULL wenn nicht gefunden */
+static const char *on_number_confirmed(int n) {
+    printf("Input: %d\n", n);
+    fflush(stdout);
+    for (int i = 0; i < (int)(sizeof(effects) / sizeof(effects[0])); i++) {
+        if (effects[i].id == n) {
+            effects[i].fn(effects[i].amount);
+            return effects[i].name;
+        }
+    }
+    printf("No function found dumbass hahahhaha\n");
+    return NULL;
+}
+
+/* Render text normal */
 static void draw_text(SDL_Renderer *ren, float x, float y, const char *text,
                       Uint8 r, Uint8 g, Uint8 b) {
     char tbuf[65536];
@@ -132,16 +191,34 @@ static void draw_text(SDL_Renderer *ren, float x, float y, const char *text,
     }
 }
 
+/* Render text skaliert – rendert erst bei Ursprung, dann skaliert + versetzt */
+static void draw_text_scaled(SDL_Renderer *ren, float x, float y, const char *text,
+                              float scale, Uint8 r, Uint8 g, Uint8 b) {
+    char tbuf[65536];
+    int quads = stb_easy_font_print(0, 0, (char *)text, NULL, tbuf, sizeof(tbuf));
+    SDL_SetRenderDrawColor(ren, r, g, b, 255);
+    for (int i = 0; i < quads; i++) {
+        float *v = (float *)(tbuf + i * 64);
+        SDL_Rect rect = {
+            (int)(x + v[0] * scale),
+            (int)(y + v[1] * scale),
+            (int)((v[4] - v[0]) * scale),
+            (int)((v[9] - v[5]) * scale)
+        };
+        SDL_RenderFillRect(ren, &rect);
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        fprintf(stderr, "Verwendung: %s <bilddatei>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <bilddatei>\n", argv[0]);
         return 1;
     }
 
     int channels;
     ctx.pixels = stbi_load(argv[1], &ctx.w, &ctx.h, &channels, 4);
     if (!ctx.pixels) {
-        fprintf(stderr, "Bild konnte nicht geladen werden: %s\n", stbi_failure_reason());
+        fprintf(stderr, "Image failed to load: %s\n", stbi_failure_reason());
         return 1;
     }
     int total_bytes = ctx.w * ctx.h * 4;
@@ -186,6 +263,7 @@ int main(int argc, char *argv[]) {
     char input[5] = {0};
     int  input_len       = 0;
     int  input_confirmed = 0;   /* 1 = Enter wurde gedrückt, Wert wird gehalten */
+    char last_effect[32] = {0}; /* Name des zuletzt angewendeten Effekts */
 
     SDL_Event e;
     int running = 1;
@@ -219,8 +297,11 @@ int main(int argc, char *argv[]) {
                 } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
                     if (input_len > 0) {
                         int n = atoi(input);
-                        if (n >= 1 && n <= 1000)
-                            on_number_confirmed(n);
+                        if (n >= 1 && n <= 1000) {
+                            const char *name = on_number_confirmed(n);
+                            if (name) snprintf(last_effect, sizeof(last_effect), "%s", name);
+                            else      snprintf(last_effect, sizeof(last_effect), "???");
+                        }
                         input_confirmed = 1;   /* Wert bleibt stehen */
                     }
                 }
@@ -238,11 +319,28 @@ int main(int argc, char *argv[]) {
         float prog_x = win_w - BORDER - stb_easy_font_width(prog_name);
         draw_text(ctx.ren, prog_x, (BORDER - 13) / 2.0f, prog_name, 255, 255, 255);
 
-        char display[16];
-        snprintf(display, sizeof(display), "> %s_", input);
-        Uint8 cr = input_len ? 255 : 120;
-        Uint8 cg = input_len ? 220 : 120;
-        Uint8 cb = input_len ?   0 : 120;
+        /* Große zentrierte Zahl über dem Bild während der Eingabe */
+        if (input_len > 0) {
+            float big_scale = 15.0f;
+            float text_w = stb_easy_font_width((char *)input) * big_scale;
+            float text_h = 13.0f * big_scale;
+            float cx = BORDER + draw_w / 2.0f - text_w / 2.0f;
+            float cy = BORDER + draw_h * 0.65f - text_h / 2.0f;
+            draw_text_scaled(ctx.ren, cx, cy, input, big_scale, 255, 220, 0);
+        }
+
+        /* Untere Konsole: Effektname nach Enter, sonst Eingabe-Prompt */
+        char display[48];
+        Uint8 cr, cg, cb;
+        if (input_confirmed && last_effect[0]) {
+            snprintf(display, sizeof(display), "> %s", last_effect);
+            cr = 100; cg = 220; cb = 100;
+        } else {
+            snprintf(display, sizeof(display), "> %s_", input);
+            cr = input_len ? 255 : 120;
+            cg = input_len ? 220 : 120;
+            cb = input_len ?   0 : 120;
+        }
         draw_text(ctx.ren, BORDER, bot_y, display, cr, cg, cb);
 
         SDL_RenderPresent(ctx.ren);
