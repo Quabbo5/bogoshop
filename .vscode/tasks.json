@@ -25,7 +25,8 @@
                     "-L",
                     "C:/msys64/mingw64/lib",
                     "-lSDL2",
-                    "-mconsole"
+                    "-lcomdlg32",
+                    "-mconsole" //disable for no terminal
                 ]
             },
             "osx": {

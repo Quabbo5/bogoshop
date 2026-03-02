@@ -2,7 +2,19 @@
   "permissions": {
     "allow": [
       "Bash(git -C /Users/admin/codespace/numpho fetch origin)",
-      "Bash(git -C /Users/admin/codespace/numpho log --oneline --graph origin/main master)"
+      "Bash(git -C /Users/admin/codespace/numpho log --oneline --graph origin/main master)",
+      "Bash(ldd /c/Users/danie/Desktop/recast/bogoshop/bogoshop/viewer.exe)",
+      "Bash(C:/msys64/mingw64/bin/gcc.exe -DSDL_MAIN_HANDLED viewer.c -o viewer.exe -g -O0 -I C:/msys64/mingw64/include -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -mconsole)",
+      "Bash(C:/msys64/mingw64/bin/gcc.exe keygen.c -o keygen.exe)",
+      "Bash(./keygen.exe 1)",
+      "Bash(./keygen.exe 42)",
+      "Bash(./keygen.exe 1000)",
+      "Bash(python3 -c \":*)",
+      "Bash(python3 -c \"from PIL import Image; print\\(''Pillow OK''\\)\")",
+      "Bash(magick --version)",
+      "Bash(convert --version)",
+      "Bash(windres icon.rc -O coff -o icon.res)",
+      "Bash(gcc -DSDL_MAIN_HANDLED viewer.c effects.c license.c icon.res -o viewer.exe -g -O0 -I C:/msys64/mingw64/include -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -mconsole)"
     ]
   }
 }

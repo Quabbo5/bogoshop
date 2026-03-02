@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gcc -DSDL_MAIN_HANDLED viewer.c effects.c license.c icon.res -o viewer_new.exe -g -O0 -I C:/msys64/mingw64/include -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -mconsole)"
+    ]
+  }
+}
