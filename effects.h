@@ -24,6 +24,8 @@ typedef struct {
     int            crop_src_w, crop_src_h;
     int            crop_ox, crop_oy;
     int            crop_active;
+    /* Preview mode: when 1, save_undo_state is a no-op */
+    int            preview_mode;
 } ImageCtx;
 
 extern ImageCtx ctx;
@@ -36,10 +38,14 @@ void        iceing(int amount);
 void        my_new_function(int amount);
 void        negative(int amount);
 void        kachel_function(int amount);
+void        gold(int amount);
 const char *on_number_confirmed(int n);
 void        crop_pan(int dx, int dy);
 const char *crop_aspect(int rw, int rh);
 void        composite(int dst_x, int dst_y, int draw_w, int draw_h,
                       int win_w, int win_h, int mirror_mode);
+void        make_preview(int effect_id,
+                         SDL_Texture **out_before, SDL_Texture **out_after,
+                         int *out_pw, int *out_ph);
 
 #endif

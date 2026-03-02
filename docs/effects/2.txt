@@ -1,0 +1,16 @@
+# Darken  [Effect 2]
+
+Decreases the brightness of every pixel by a fixed amount.
+
+## Usage
+
+Type  2  and press ENTER to apply with default strength.
+
+## Parameters
+
+- Amount: 0 - 255  (default: 20)
+
+## Notes
+
+- Clamps at 0 per channel, no underflow.
+- Use Brighten (effect 1) to reverse.

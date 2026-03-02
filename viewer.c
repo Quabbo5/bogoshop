@@ -21,6 +21,38 @@
 
 #define BOGOSHOP_VERSION "0.1.2_PRE_RELEASE"
 
+#define HELP_MAX_LINES 512
+#define HELP_LINE_LEN  256
+
+/* Gibt den Ordner der laufenden .exe zurück (mit trailing backslash) */
+static void get_exe_dir(char *out, int out_size) {
+    out[0] = '\0';
+#ifdef _WIN32
+    char exe[MAX_PATH];
+    GetModuleFileNameA(NULL, exe, sizeof(exe));
+    char *last = strrchr(exe, '\\');
+    if (last) { *(last + 1) = '\0'; strncpy(out, exe, out_size - 1); }
+#endif
+}
+
+static int load_help(const char *rel_path, char lines[][HELP_LINE_LEN], int max) {
+    char exe_dir[MAX_PATH];
+    get_exe_dir(exe_dir, sizeof(exe_dir));
+    char full_path[MAX_PATH];
+    snprintf(full_path, sizeof(full_path), "%s%s", exe_dir, rel_path);
+    FILE *f = fopen(full_path, "r");
+    if (!f) return 0;
+    int n = 0;
+    while (n < max && fgets(lines[n], HELP_LINE_LEN, f)) {
+        int len = (int)strlen(lines[n]);
+        if (len > 0 && lines[n][len - 1] == '\n') lines[n][len - 1] = '\0';
+        if (len > 1 && lines[n][len - 2] == '\r') lines[n][len - 2] = '\0';
+        n++;
+    }
+    fclose(f);
+    return n;
+}
+
 #ifdef _WIN32
 static int open_file_dialog(char *out, int out_size) {
     OPENFILENAMEA ofn = {0};
@@ -176,7 +208,7 @@ int main(int argc, char *argv[]) {
                 size_t n;
                 while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
                     fwrite(buf, 1, n, dst_f);
-                printf("Backup: %s\n", backup_path); fflush(stdout);
+                printf("Backup created: %s\n", backup_path); fflush(stdout);
             }
             if (src)   fclose(src);
             if (dst_f) fclose(dst_f);
@@ -247,7 +279,17 @@ int main(int argc, char *argv[]) {
     char input[8] = {0};
     int  input_len       = 0;
     int  input_confirmed = 0;   /* 1 = Enter wurde gedrückt, Wert wird gehalten */
-    char last_effect[128] = {0}; /* Name des zuletzt angewendeten Effekts */
+    char last_effect[128] = {0};
+    int  help_mode         = 0;
+    int  help_scroll       = 0;
+    int  help_line_count   = 0;
+    int  help_saved_win_w  = 0;
+    int  help_saved_win_h  = 0;
+    SDL_Texture *help_tex_before = NULL;
+    SDL_Texture *help_tex_after  = NULL;
+    int  help_preview_w    = 0;
+    int  help_preview_h    = 0;
+    static char help_lines[HELP_MAX_LINES][HELP_LINE_LEN];
 
     SDL_Event e;
     int running = 1;
@@ -258,8 +300,59 @@ int main(int argc, char *argv[]) {
             if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
 
-                if (k == SDLK_ESCAPE || k == SDLK_q) {
-                    if (pending_quit) {
+#define HELP_WIN_W 780
+#define HELP_WIN_H 680
+                if (k == SDLK_h) {
+                    if (help_mode) {
+                        help_mode = 0;
+                        win_w = help_saved_win_w;
+                        win_h = help_saved_win_h;
+                        SDL_SetWindowSize(ctx.win, win_w, win_h);
+                        SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                        if (help_tex_before) { SDL_DestroyTexture(help_tex_before); help_tex_before = NULL; }
+                        if (help_tex_after)  { SDL_DestroyTexture(help_tex_after);  help_tex_after  = NULL; }
+                    } else {
+                        char path[MAX_PATH];
+                        int effect_n = 0;
+                        if (input_len > 0) {
+                            effect_n = atoi(input);
+                            snprintf(path, sizeof(path), "docs/effects/%d.txt", effect_n);
+                            input_len = 0; input[0] = '\0';
+                        } else {
+                            snprintf(path, sizeof(path), "docs/README.txt");
+                        }
+                        help_line_count = load_help(path, help_lines, HELP_MAX_LINES);
+                        if (help_line_count > 0) {
+                            help_saved_win_w = win_w;
+                            help_saved_win_h = win_h;
+                            win_w = HELP_WIN_W;
+                            win_h = HELP_WIN_H;
+                            SDL_SetWindowSize(ctx.win, win_w, win_h);
+                            SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                            help_mode   = 1;
+                            help_scroll = 0;
+                            input_confirmed = 0;
+                            if (help_tex_before) { SDL_DestroyTexture(help_tex_before); help_tex_before = NULL; }
+                            if (help_tex_after)  { SDL_DestroyTexture(help_tex_after);  help_tex_after  = NULL; }
+                            if (effect_n > 0)
+                                make_preview(effect_n, &help_tex_before, &help_tex_after,
+                                             &help_preview_w, &help_preview_h);
+                        } else {
+                            snprintf(last_effect, sizeof(last_effect),
+                                     "Help: file not found (%s)", path);
+                            input_confirmed = 1;
+                        }
+                    }
+                } else if (k == SDLK_ESCAPE || k == SDLK_q) {
+                    if (help_mode) {
+                        help_mode = 0;
+                        win_w = help_saved_win_w;
+                        win_h = help_saved_win_h;
+                        SDL_SetWindowSize(ctx.win, win_w, win_h);
+                        SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                        if (help_tex_before) { SDL_DestroyTexture(help_tex_before); help_tex_before = NULL; }
+                        if (help_tex_after)  { SDL_DestroyTexture(help_tex_after);  help_tex_after  = NULL; }
+                    } else if (pending_quit) {
                         running = 0; /* zweites Q/ESC → force quit */
                     } else {
                         pending_quit  = 1;
@@ -323,6 +416,9 @@ int main(int argc, char *argv[]) {
                         }
                         input_confirmed = 1;   /* Wert bleibt stehen */
                     }
+                } else if (help_mode && (k == SDLK_UP || k == SDLK_DOWN)) {
+                    if (k == SDLK_UP   && help_scroll > 0) help_scroll--;
+                    if (k == SDLK_DOWN && help_scroll < help_line_count - 1) help_scroll++;
                 } else if (k == SDLK_UP || k == SDLK_DOWN ||
                            k == SDLK_LEFT || k == SDLK_RIGHT) {
                     if (mirror_mode || zoom_level > 1.0f) {
@@ -585,6 +681,59 @@ int main(int argc, char *argv[]) {
             int tw    = text_width(display);
             float sc  = tw > 0 && tw > avail ? (float)avail / tw : 1.0f;
             draw_text_scaled(ctx.ren, BORDER, bot_y, display, sc, cr, cg, cb);
+        }
+
+        /* ── Help / Doc Modus ──────────────────────────────────────────── */
+        if (help_mode) {
+            SDL_SetRenderDrawColor(ctx.ren, 18, 18, 18, 255);
+            SDL_Rect overlay = { 0, 0, win_w, win_h };
+            SDL_RenderFillRect(ctx.ren, &overlay);
+
+            int y_start = BORDER;
+
+            /* Before/After preview images (only for effect docs) */
+            if (help_tex_before && help_tex_after) {
+                int gap     = 16;
+                int total_w = help_preview_w * 2 + gap;
+                int px      = (win_w - total_w) / 2;
+                int py      = BORDER;
+                SDL_Rect rbefore = { px,                           py, help_preview_w, help_preview_h };
+                SDL_Rect rafter  = { px + help_preview_w + gap,   py, help_preview_w, help_preview_h };
+                SDL_RenderCopy(ctx.ren, help_tex_before, NULL, &rbefore);
+                SDL_RenderCopy(ctx.ren, help_tex_after,  NULL, &rafter);
+                int lbl_y = py + help_preview_h + 3;
+                draw_text(ctx.ren, px,                         lbl_y, "Before", 140, 140, 140);
+                draw_text(ctx.ren, px + help_preview_w + gap, lbl_y, "After",  120, 220, 120);
+                y_start = lbl_y + 14;
+            }
+
+            int line_h    = 14;
+            int x_margin  = BORDER;
+            int lines_vis = (win_h - y_start - BORDER - 20) / line_h;
+
+            for (int i = 0; i < lines_vis; i++) {
+                int idx = help_scroll + i;
+                if (idx >= help_line_count) break;
+                const char *line = help_lines[idx];
+                float y = y_start + i * line_h;
+                if (line[0] == '#' && line[1] == '#') {
+                    draw_text(ctx.ren, x_margin, y, line + 2, 120, 200, 255);
+                } else if (line[0] == '#') {
+                    draw_text_scaled(ctx.ren, x_margin, y, line + 1, 1.3f, 255, 220, 80);
+                } else if (line[0] == '-' || line[0] == '*') {
+                    draw_text(ctx.ren, x_margin + 8, y, line, 180, 180, 180);
+                } else if (line[0] == '\0') {
+                    /* empty line — skip */
+                } else {
+                    draw_text(ctx.ren, x_margin, y, line, 210, 210, 210);
+                }
+            }
+
+            /* Scrollbar-Indikator + Hinweis */
+            char hint[48];
+            snprintf(hint, sizeof(hint), "[%d/%d] UP/DOWN  H/ESC = close",
+                     help_scroll + 1, help_line_count);
+            draw_text(ctx.ren, x_margin, win_h - BORDER / 2 - 6, hint, 80, 80, 80);
         }
 
         SDL_RenderPresent(ctx.ren);

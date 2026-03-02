@@ -3,10 +3,11 @@
 ## viewer.exe
 
 Die Quelldateien müssen alle zusammen kompiliert werden:
-- `viewer.c` — main, Render-Hilfsfunktionen
-- `effects.c` — Bildeffekte, Undo/Reset
-- `license.c` — Produktschlüssel, Lizenz-Screen
-- `icon.res` — eingebettetes App-Icon (aus icon.rc + icon.ico)
+- `viewer.c`    — main, Render-Hilfsfunktionen
+- `effects.c`   — nummerierte Bildeffekte + Effekt-Tabelle
+- `functions.c` — Hotkey-Funktionen (reset, undo, crop, composite)
+- `license.c`   — Produktschlüssel, Lizenz-Screen
+- `icon.res`    — eingebettetes App-Icon (aus icon.rc + icon.ico)
 
 ### Schritt 1: icon.res generieren (nur einmal nötig, bzw. wenn icon.png geändert wird)
 ```bash
@@ -15,12 +16,12 @@ windres icon.rc -O coff -o icon.res
 
 ### Debug (mit Konsolenfenster)
 ```bash
-gcc -DSDL_MAIN_HANDLED viewer.c effects.c license.c icon.res -o viewer.exe -g -O0 -I C:/msys64/mingw64/include -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -mconsole
+gcc -DSDL_MAIN_HANDLED viewer.c effects.c functions.c license.c icon.res -o viewer.exe -g -O0 -I C:/msys64/mingw64/include -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -mconsole
 ```
 
 ### Release (kein Konsolenfenster, optimiert)
 ```bash
-gcc -DSDL_MAIN_HANDLED viewer.c effects.c license.c icon.res -o viewer.exe -O2 -s -I C:/msys64/mingw64/include -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -mwindows
+gcc -DSDL_MAIN_HANDLED viewer.c effects.c functions.c license.c icon.res -o viewer.exe -O2 -s -I C:/msys64/mingw64/include -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -mwindows
 ```
 
 ### icon.ico neu generieren (wenn icon.png ausgetauscht wird)
@@ -57,3 +58,10 @@ Diese 3 Dateien zusammen verschicken (als ZIP):
 - `libwinpthread-1.dll`  — aus `C:/msys64/mingw64/bin/`
 
 Das Icon ist direkt im `viewer.exe` eingebettet — keine `icon.png` nötig.
+
+
+# Commands
+```text
+e102
+102
+

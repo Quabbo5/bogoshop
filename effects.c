@@ -6,46 +6,11 @@
 ImageCtx ctx;
 
 static void save_undo_state(void) {
+    if (ctx.preview_mode) return;
     int total_bytes = ctx.w * ctx.h * 4;
     memcpy(ctx.undo_stack[ctx.undo_head], ctx.pixels, total_bytes);
     ctx.undo_head = (ctx.undo_head + 1) % UNDO_HISTORY;
     if (ctx.undo_count < UNDO_HISTORY) ctx.undo_count++;
-}
-
-/* ── R: Bild auf Original zurücksetzen ───────────────────────────────── */
-void reset_image(void) {
-    if (ctx.crop_src) { free(ctx.crop_src); ctx.crop_src = NULL; }
-    ctx.crop_active = 0;
-    ctx.crop_ox = ctx.crop_oy = 0;
-    if (ctx.w != ctx.orig_w || ctx.h != ctx.orig_h) {
-        free(ctx.pixels);
-        ctx.pixels = malloc(ctx.orig_w * ctx.orig_h * 4);
-        ctx.w = ctx.orig_w;
-        ctx.h = ctx.orig_h;
-        SDL_DestroyTexture(ctx.tex);
-        ctx.tex = SDL_CreateTexture(ctx.ren, SDL_PIXELFORMAT_RGBA32,
-                                    SDL_TEXTUREACCESS_STREAMING, ctx.w, ctx.h);
-        ctx.needs_layout_update = 1;
-    }
-    memcpy(ctx.pixels, ctx.original_pixels, ctx.w * ctx.h * 4);
-    ctx.undo_head  = 0;
-    ctx.undo_count = 0;
-    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
-    printf("Reset\n"); fflush(stdout);
-}
-
-/* ── U: Letzten Schritt rückgängig machen ────────────────────────────── */
-void undo_last(void) {
-    if (ctx.undo_count == 0) {
-        printf("No undo's left\n"); fflush(stdout);
-        return;
-    }
-    int total_bytes = ctx.w * ctx.h * 4;
-    ctx.undo_head = (ctx.undo_head - 1 + UNDO_HISTORY) % UNDO_HISTORY;
-    ctx.undo_count--;
-    memcpy(ctx.pixels, ctx.undo_stack[ctx.undo_head], total_bytes);
-    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
-    printf("Undo (%d/%d left)\n", ctx.undo_count, UNDO_HISTORY); fflush(stdout);
 }
 
 /* ── Bild um 'amount' aufhellen (0–255) und Textur aktualisieren ─────── */
@@ -136,6 +101,122 @@ void kachel_function(int amount) {
     SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
 }
 
+/* ── Gold: Dreieck-Rasterizer (Scanline) ─────────────────────────────── */
+static void fill_tri(unsigned char *px, int w, int h,
+                     int x0, int y0, int x1, int y1, int x2, int y2,
+                     int dr, int dg, int db) {
+    /* Vertices nach Y sortieren */
+    #define SWAP2(a,b) { int _t=(a);(a)=(b);(b)=_t; }
+    if (y0 > y1) { SWAP2(y0,y1); SWAP2(x0,x1); }
+    if (y0 > y2) { SWAP2(y0,y2); SWAP2(x0,x2); }
+    if (y1 > y2) { SWAP2(y1,y2); SWAP2(x1,x2); }
+    #undef SWAP2
+
+    for (int y = y0; y <= y2; y++) {
+        if (y < 0 || y >= h) continue;
+        float xa, xb;
+        if (y <= y1) {
+            float t01 = (y1==y0) ? 1.f : (float)(y-y0)/(y1-y0);
+            float t02 = (y2==y0) ? 1.f : (float)(y-y0)/(y2-y0);
+            xa = x0 + t01*(x1-x0);
+            xb = x0 + t02*(x2-x0);
+        } else {
+            float t12 = (y2==y1) ? 1.f : (float)(y-y1)/(y2-y1);
+            float t02 = (y2==y0) ? 1.f : (float)(y-y0)/(y2-y0);
+            xa = x1 + t12*(x2-x1);
+            xb = x0 + t02*(x2-x0);
+        }
+        if (xa > xb) { float t=xa; xa=xb; xb=t; }
+        for (int x = (int)xa; x <= (int)xb; x++) {
+            if (x < 0 || x >= w) continue;
+            int i = (y*w + x)*4;
+            int r = px[i+0]+dr, g = px[i+1]+dg, b = px[i+2]+db;
+            px[i+0] = r<0?0:r>255?255:(unsigned char)r;
+            px[i+1] = g<0?0:g>255?255:(unsigned char)g;
+            px[i+2] = b<0?0:b>255?255:(unsigned char)b;
+        }
+    }
+}
+
+/* ── Gold: Jittered-Grid Tessellation ────────────────────────────────── */
+void gold(int amount) {
+    const char *EFFECT_ID   = "007";
+    const char *EFFECT_NAME = "Gold Dust";
+    save_undo_state();
+    int w = ctx.w, h = ctx.h;
+
+    /* 1. Gold-Tint über alle Pixel blenden */
+    float t = 0.42f;
+    for (int i = 0; i < w * h; i++) {
+        unsigned char *p = ctx.pixels + i*4;
+        p[0] = (unsigned char)(p[0]*(1.f-t) + 255*t);
+        p[1] = (unsigned char)(p[1]*(1.f-t) + 195*t);
+        p[2] = (unsigned char)(p[2]*(1.f-t) +  20*t);
+    }
+
+    /* 2. Jittered Grid: Raster mit leicht verschobenen Punkten */
+    int cols = 8 + amount / 6;       /* Anzahl Spalten */
+    int rows = cols * h / w;         /* Zeilen proportional */
+    if (rows < 3) rows = 3;
+
+    int gw = cols + 1, gh = rows + 1;
+    float *gx = malloc(gw * gh * sizeof(float));
+    float *gy = malloc(gw * gh * sizeof(float));
+    if (!gx || !gy) { free(gx); free(gy); return; }
+
+    float cw = (float)w / cols;
+    float ch = (float)h / rows;
+
+    for (int r = 0; r < gh; r++) {
+        for (int c = 0; c < gw; c++) {
+            float jx = (c > 0 && c < gw-1)
+                       ? ((float)(rand()%1000)/1000.f * 2.f - 1.f) * cw * 0.38f : 0.f;
+            float jy = (r > 0 && r < gh-1)
+                       ? ((float)(rand()%1000)/1000.f * 2.f - 1.f) * ch * 0.38f : 0.f;
+            gx[r*gw + c] = c * cw + jx;
+            gy[r*gw + c] = r * ch + jy;
+        }
+    }
+
+    /* 3. Jede Zelle → 2 verbundene Dreiecke */
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            int tl = r*gw + c,   tr = r*gw + c+1;
+            int bl = (r+1)*gw+c, br = (r+1)*gw+c+1;
+
+            /* Jedes Dreieck bekommt eigenen Shimmer */
+            for (int tri = 0; tri < 2; tri++) {
+                int roll  = rand() % 10;
+                int light = roll >= 3;       /* 70% hell */
+                int glint = roll == 9;       /* 10% sehr heller Glint */
+                int dark  = roll < 3;        /* 30% tief dunkel */
+                int s = glint ? (60 + rand()%40)
+                      : light ? (25 + rand()%40)
+                      :         (25 + rand()%35);
+                int dr = glint ?  s                   : light ?  s              : -(s*3/4);
+                int dg = glint ? (int)(s*.90f)        : light ? (int)(s*.72f)   : -s;
+                int db = glint ? (int)(s*.55f)        : light ? -(s/3)          : -s;
+
+                if (tri == 0)
+                    fill_tri(ctx.pixels, w, h,
+                             (int)gx[tl],(int)gy[tl],
+                             (int)gx[tr],(int)gy[tr],
+                             (int)gx[bl],(int)gy[bl], dr,dg,db);
+                else
+                    fill_tri(ctx.pixels, w, h,
+                             (int)gx[tr],(int)gy[tr],
+                             (int)gx[br],(int)gy[br],
+                             (int)gx[bl],(int)gy[bl], dr,dg,db);
+            }
+        }
+    }
+
+    free(gx); free(gy);
+    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
+    printf("Applied: %s -- ID: %s (%dx%d grid, %d tris)\n", EFFECT_NAME, EFFECT_ID, cols, rows, cols*rows*2);
+    fflush(stdout);
+}
+
 /* ── Effect-Tabelle: ID → Funktion → Amount → Name ───────────────────── */
 static const struct {
     int         id;
@@ -149,148 +230,8 @@ static const struct {
     { 4, my_new_function, 30, "MyFunc"    },
     { 5, negative,         0, "Negative"  },
     { 6, kachel_function,  0, "Kachel"    },
+    { 7, gold,            40, "Gold"      },
 };
-
-/* ── Crop: Bild auf Seitenverhältnis rw:rh zuschneiden (zentriert) ──── */
-const char *crop_aspect(int rw, int rh) {
-    if (rw <= 0 || rh <= 0) return NULL;
-
-    /* Quelle für Pan merken (alte crop_src freigeben falls vorhanden) */
-    if (ctx.crop_src) free(ctx.crop_src);
-    ctx.crop_src = malloc(ctx.w * ctx.h * 4);
-    if (!ctx.crop_src) return NULL;
-    memcpy(ctx.crop_src, ctx.pixels, ctx.w * ctx.h * 4);
-    ctx.crop_src_w = ctx.w;
-    ctx.crop_src_h = ctx.h;
-
-    int new_w, new_h;
-    if ((long long)ctx.crop_src_w * rh > (long long)ctx.crop_src_h * rw) {
-        new_h = ctx.crop_src_h;
-        new_w = ctx.crop_src_h * rw / rh;
-    } else {
-        new_w = ctx.crop_src_w;
-        new_h = ctx.crop_src_w * rh / rw;
-    }
-
-    if (new_w <= 0 || new_h <= 0) { free(ctx.crop_src); ctx.crop_src = NULL; return NULL; }
-
-    ctx.crop_ox = (ctx.crop_src_w - new_w) / 2;
-    ctx.crop_oy = (ctx.crop_src_h - new_h) / 2;
-    ctx.crop_active = 1;
-
-    unsigned char *new_pixels = malloc(new_w * new_h * 4);
-    if (!new_pixels) { free(ctx.crop_src); ctx.crop_src = NULL; return NULL; }
-
-    for (int y = 0; y < new_h; y++)
-        memcpy(new_pixels + y * new_w * 4,
-               ctx.crop_src + ((ctx.crop_oy + y) * ctx.crop_src_w + ctx.crop_ox) * 4,
-               new_w * 4);
-
-    free(ctx.pixels);
-    ctx.pixels = new_pixels;
-    ctx.w = new_w;
-    ctx.h = new_h;
-
-    ctx.undo_head  = 0;
-    ctx.undo_count = 0;
-
-    SDL_DestroyTexture(ctx.tex);
-    ctx.tex = SDL_CreateTexture(ctx.ren, SDL_PIXELFORMAT_RGBA32,
-                                SDL_TEXTUREACCESS_STREAMING, ctx.w, ctx.h);
-    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
-
-    ctx.needs_layout_update = 1;
-    printf("Crop %d:%d → %dx%d\n", rw, rh, new_w, new_h); fflush(stdout);
-    return "Crop";
-}
-
-/* ── Pfeil: Crop-Fenster innerhalb der Quelle verschieben ────────────── */
-void crop_pan(int dx, int dy) {
-    if (!ctx.crop_active) return;
-
-    int max_ox = ctx.crop_src_w - ctx.w;
-    int max_oy = ctx.crop_src_h - ctx.h;
-
-    ctx.crop_ox += dx;
-    ctx.crop_oy += dy;
-    if (ctx.crop_ox < 0)      ctx.crop_ox = 0;
-    if (ctx.crop_oy < 0)      ctx.crop_oy = 0;
-    if (ctx.crop_ox > max_ox) ctx.crop_ox = max_ox;
-    if (ctx.crop_oy > max_oy) ctx.crop_oy = max_oy;
-
-    for (int y = 0; y < ctx.h; y++)
-        memcpy(ctx.pixels + y * ctx.w * 4,
-               ctx.crop_src + ((ctx.crop_oy + y) * ctx.crop_src_w + ctx.crop_ox) * 4,
-               ctx.w * 4);
-
-    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
-}
-
-/* ── C: Aktuellen Viewport einfrieren und als neues Bild übernehmen ──── */
-void composite(int dst_x, int dst_y, int draw_w, int draw_h,
-               int win_w, int win_h, int mirror_mode) {
-    int vp_w = win_w - 2 * BORDER;
-    int vp_h = win_h - 2 * BORDER;
-    unsigned char *out = calloc(vp_w * vp_h * 4, 1);
-    if (!out) return;
-
-    float scale_x = (float)ctx.w / draw_w;
-    float scale_y = (float)ctx.h / draw_h;
-
-    for (int py = 0; py < vp_h; py++) {
-        for (int px = 0; px < vp_w; px++) {
-            int rel_x = (BORDER + px) - dst_x;
-            int rel_y = (BORDER + py) - dst_y;
-            int wx, wy;
-
-            if (mirror_mode) {
-                int tx = rel_x / draw_w; if (rel_x < 0 && rel_x % draw_w != 0) tx--;
-                int ty = rel_y / draw_h; if (rel_y < 0 && rel_y % draw_h != 0) ty--;
-                wx = rel_x - tx * draw_w;
-                wy = rel_y - ty * draw_h;
-                if (abs(tx) % 2 == 1) wx = draw_w - 1 - wx;
-                if (abs(ty) % 2 == 1) wy = draw_h - 1 - wy;
-            } else {
-                wx = rel_x; wy = rel_y;
-                if (wx < 0 || wx >= draw_w || wy < 0 || wy >= draw_h) continue;
-            }
-
-            int sx = (int)(wx * scale_x); if (sx >= ctx.w) sx = ctx.w - 1;
-            int sy = (int)(wy * scale_y); if (sy >= ctx.h) sy = ctx.h - 1;
-            int oi = (py * vp_w + px) * 4;
-            int si = (sy  * ctx.w + sx) * 4;
-            out[oi+0] = ctx.pixels[si+0];
-            out[oi+1] = ctx.pixels[si+1];
-            out[oi+2] = ctx.pixels[si+2];
-            out[oi+3] = ctx.pixels[si+3];
-        }
-    }
-
-    free(ctx.pixels);
-    ctx.pixels = out;
-    free(ctx.original_pixels);
-    ctx.original_pixels = malloc(vp_w * vp_h * 4);
-    if (ctx.original_pixels) memcpy(ctx.original_pixels, out, vp_w * vp_h * 4);
-    ctx.w = ctx.orig_w = vp_w;
-    ctx.h = ctx.orig_h = vp_h;
-
-    int nb = vp_w * vp_h * 4;
-    for (int i = 0; i < UNDO_HISTORY; i++) {
-        free(ctx.undo_stack[i]);
-        ctx.undo_stack[i] = malloc(nb);
-    }
-    ctx.undo_head = ctx.undo_count = 0;
-
-    if (ctx.crop_src) { free(ctx.crop_src); ctx.crop_src = NULL; }
-    ctx.crop_active = 0;
-
-    SDL_DestroyTexture(ctx.tex);
-    ctx.tex = SDL_CreateTexture(ctx.ren, SDL_PIXELFORMAT_RGBA32,
-                                SDL_TEXTUREACCESS_STREAMING, ctx.w, ctx.h);
-    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
-    ctx.needs_layout_update = 1;
-    printf("Composite %dx%d\n", vp_w, vp_h); fflush(stdout);
-}
 
 /* catching signals – gibt den Effektnamen zurück, NULL wenn nicht gefunden */
 const char *on_number_confirmed(int n) {
@@ -304,4 +245,80 @@ const char *on_number_confirmed(int n) {
     }
     printf("No function found\n");
     return NULL;
+}
+
+/* ── Vorschau: skaliertes Before/After für Help-Modus ────────────────── */
+void make_preview(int effect_id,
+                  SDL_Texture **out_before, SDL_Texture **out_after,
+                  int *out_pw, int *out_ph) {
+    const int MAX_PV = 200;
+    float fsx = (float)MAX_PV / ctx.w;
+    float fsy = (float)MAX_PV / ctx.h;
+    float sc  = fsx < fsy ? fsx : fsy;
+    int pw = (int)(ctx.w * sc);
+    int ph = (int)(ctx.h * sc);
+    if (pw < 1) pw = 1;
+    if (ph < 1) ph = 1;
+
+    /* Nearest-neighbour downscale → preview buffer */
+    unsigned char *pv = malloc(pw * ph * 4);
+    if (!pv) return;
+    for (int y = 0; y < ph; y++) {
+        for (int x = 0; x < pw; x++) {
+            int ix = (int)((float)x / pw * ctx.w);
+            int iy = (int)((float)y / ph * ctx.h);
+            if (ix >= ctx.w) ix = ctx.w - 1;
+            if (iy >= ctx.h) iy = ctx.h - 1;
+            int di = (y * pw + x) * 4;
+            int si = (iy * ctx.w + ix) * 4;
+            pv[di+0] = ctx.pixels[si+0];
+            pv[di+1] = ctx.pixels[si+1];
+            pv[di+2] = ctx.pixels[si+2];
+            pv[di+3] = ctx.pixels[si+3];
+        }
+    }
+
+    /* "Before" texture */
+    SDL_Texture *tbefore = SDL_CreateTexture(ctx.ren, SDL_PIXELFORMAT_RGBA32,
+                                             SDL_TEXTUREACCESS_STATIC, pw, ph);
+    if (!tbefore) { free(pv); return; }
+    SDL_UpdateTexture(tbefore, NULL, pv, pw * 4);
+
+    /* Swap ctx to isolated preview state */
+    unsigned char *save_pixels = ctx.pixels;
+    int save_w = ctx.w, save_h = ctx.h;
+    SDL_Texture *save_tex = ctx.tex;
+
+    ctx.pixels = malloc(pw * ph * 4);
+    if (!ctx.pixels) {
+        ctx.pixels = save_pixels; ctx.w = save_w; ctx.h = save_h; ctx.tex = save_tex;
+        free(pv); SDL_DestroyTexture(tbefore); return;
+    }
+    memcpy(ctx.pixels, pv, pw * ph * 4);
+    ctx.w = pw; ctx.h = ph;
+    ctx.tex = SDL_CreateTexture(ctx.ren, SDL_PIXELFORMAT_RGBA32,
+                                SDL_TEXTUREACCESS_STREAMING, pw, ph);
+    ctx.preview_mode = 1;
+
+    /* Apply effect in isolated state */
+    on_number_confirmed(effect_id);
+
+    /* "After" texture */
+    SDL_Texture *tafter = SDL_CreateTexture(ctx.ren, SDL_PIXELFORMAT_RGBA32,
+                                            SDL_TEXTUREACCESS_STATIC, pw, ph);
+    if (tafter) SDL_UpdateTexture(tafter, NULL, ctx.pixels, pw * 4);
+
+    /* Restore original ctx */
+    free(ctx.pixels);
+    SDL_DestroyTexture(ctx.tex);
+    ctx.pixels = save_pixels;
+    ctx.w = save_w; ctx.h = save_h;
+    ctx.tex = save_tex;
+    ctx.preview_mode = 0;
+
+    free(pv);
+    *out_before = tbefore;
+    *out_after  = tafter;
+    *out_pw     = pw;
+    *out_ph     = ph;
 }

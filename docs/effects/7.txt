@@ -1,0 +1,23 @@
+# Gold  [Effect 7]
+
+Applies a gold-leaf overlay to the image using randomized triangle
+facets with highlight and shadow variations to simulate gilded metal.
+
+## Usage
+
+Type  7  and press ENTER to apply with default settings.
+
+## How it works
+
+1. A warm gold tint (R=255 G=190 B=30) is blended over all pixels
+2. Random triangles and quads are drawn as facets
+3. 2/3 of facets are highlights (warm, brighter)
+4. 1/3 of facets are shadows (cooler, darker)
+5. The variation between facets creates the shimmer effect
+
+## Notes
+
+- Each application uses a different random seed, so results vary.
+- Apply multiple times to intensify the effect.
+- Works best on portraits or textured images.
+- Use U to undo.

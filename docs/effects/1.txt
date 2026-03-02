@@ -1,0 +1,18 @@
+# Brighten  [Effect 1]
+
+Increases the brightness of every pixel by a fixed amount.
+
+## Usage
+
+Type  1  and press ENTER to apply with default strength.
+Type  50  and press ENTER, then select effect 1 to use custom amount.
+
+## Parameters
+
+- Amount: 0 - 255  (default: 20)
+
+## Notes
+
+- Clamps at 255 per channel, no overflow.
+- Apply multiple times for a stronger effect.
+- Use Darken (effect 2) to reverse.
