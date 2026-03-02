@@ -226,6 +226,72 @@ void crop_pan(int dx, int dy) {
     SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
 }
 
+/* ── C: Aktuellen Viewport einfrieren und als neues Bild übernehmen ──── */
+void composite(int dst_x, int dst_y, int draw_w, int draw_h,
+               int win_w, int win_h, int mirror_mode) {
+    int vp_w = win_w - 2 * BORDER;
+    int vp_h = win_h - 2 * BORDER;
+    unsigned char *out = calloc(vp_w * vp_h * 4, 1);
+    if (!out) return;
+
+    float scale_x = (float)ctx.w / draw_w;
+    float scale_y = (float)ctx.h / draw_h;
+
+    for (int py = 0; py < vp_h; py++) {
+        for (int px = 0; px < vp_w; px++) {
+            int rel_x = (BORDER + px) - dst_x;
+            int rel_y = (BORDER + py) - dst_y;
+            int wx, wy;
+
+            if (mirror_mode) {
+                int tx = rel_x / draw_w; if (rel_x < 0 && rel_x % draw_w != 0) tx--;
+                int ty = rel_y / draw_h; if (rel_y < 0 && rel_y % draw_h != 0) ty--;
+                wx = rel_x - tx * draw_w;
+                wy = rel_y - ty * draw_h;
+                if (abs(tx) % 2 == 1) wx = draw_w - 1 - wx;
+                if (abs(ty) % 2 == 1) wy = draw_h - 1 - wy;
+            } else {
+                wx = rel_x; wy = rel_y;
+                if (wx < 0 || wx >= draw_w || wy < 0 || wy >= draw_h) continue;
+            }
+
+            int sx = (int)(wx * scale_x); if (sx >= ctx.w) sx = ctx.w - 1;
+            int sy = (int)(wy * scale_y); if (sy >= ctx.h) sy = ctx.h - 1;
+            int oi = (py * vp_w + px) * 4;
+            int si = (sy  * ctx.w + sx) * 4;
+            out[oi+0] = ctx.pixels[si+0];
+            out[oi+1] = ctx.pixels[si+1];
+            out[oi+2] = ctx.pixels[si+2];
+            out[oi+3] = ctx.pixels[si+3];
+        }
+    }
+
+    free(ctx.pixels);
+    ctx.pixels = out;
+    free(ctx.original_pixels);
+    ctx.original_pixels = malloc(vp_w * vp_h * 4);
+    if (ctx.original_pixels) memcpy(ctx.original_pixels, out, vp_w * vp_h * 4);
+    ctx.w = ctx.orig_w = vp_w;
+    ctx.h = ctx.orig_h = vp_h;
+
+    int nb = vp_w * vp_h * 4;
+    for (int i = 0; i < UNDO_HISTORY; i++) {
+        free(ctx.undo_stack[i]);
+        ctx.undo_stack[i] = malloc(nb);
+    }
+    ctx.undo_head = ctx.undo_count = 0;
+
+    if (ctx.crop_src) { free(ctx.crop_src); ctx.crop_src = NULL; }
+    ctx.crop_active = 0;
+
+    SDL_DestroyTexture(ctx.tex);
+    ctx.tex = SDL_CreateTexture(ctx.ren, SDL_PIXELFORMAT_RGBA32,
+                                SDL_TEXTUREACCESS_STREAMING, ctx.w, ctx.h);
+    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
+    ctx.needs_layout_update = 1;
+    printf("Composite %dx%d\n", vp_w, vp_h); fflush(stdout);
+}
+
 /* catching signals – gibt den Effektnamen zurück, NULL wenn nicht gefunden */
 const char *on_number_confirmed(int n) {
     printf("Input: %d\n", n);

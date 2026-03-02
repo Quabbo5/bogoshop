@@ -39,5 +39,7 @@ void        kachel_function(int amount);
 const char *on_number_confirmed(int n);
 void        crop_pan(int dx, int dy);
 const char *crop_aspect(int rw, int rh);
+void        composite(int dst_x, int dst_y, int draw_w, int draw_h,
+                      int win_w, int win_h, int mirror_mode);
 
 #endif

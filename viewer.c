@@ -140,6 +140,8 @@ int main(int argc, char *argv[]) {
 
     float zoom_level  = 1.0f;
     int   mirror_mode = 0;
+    int   fullscreen  = 0;
+    Uint8 bg_r = 0, bg_g = 0, bg_b = 0;
     int max_img = MAX_SIZE - 2 * BORDER;
     float scale = 1.0f;
     if (ctx.w > max_img || ctx.h > max_img) {
@@ -300,6 +302,28 @@ int main(int argc, char *argv[]) {
                     snprintf(last_effect, sizeof(last_effect),
                              mirror_mode ? "Mirror ON" : "Mirror OFF");
                     input_confirmed = 1; input_len = 0; input[0] = '\0';
+                } else if (k == SDLK_c) {
+                    composite(dst.x, dst.y, draw_w, draw_h, win_w, win_h, mirror_mode);
+                    mirror_mode = 0;
+                    snprintf(last_effect, sizeof(last_effect), "Composite");
+                    input_confirmed = 1; input_len = 0; input[0] = '\0';
+                } else if (k == SDLK_t) {
+                    bg_r = rand() % 256;
+                    bg_g = rand() % 256;
+                    bg_b = rand() % 256;
+                    snprintf(last_effect, sizeof(last_effect),
+                             "BG #%02X%02X%02X", bg_r, bg_g, bg_b);
+                    input_confirmed = 1; input_len = 0; input[0] = '\0';
+                } else if (k == SDLK_f) {
+                    fullscreen = !fullscreen;
+                    SDL_SetWindowFullscreen(ctx.win,
+                        fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    if (!fullscreen)
+                        SDL_SetWindowPosition(ctx.win,
+                            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                    snprintf(last_effect, sizeof(last_effect),
+                             fullscreen ? "Fullscreen ON" : "Fullscreen OFF");
+                    input_confirmed = 1; input_len = 0; input[0] = '\0';
                 }
             }
 
@@ -325,12 +349,9 @@ int main(int argc, char *argv[]) {
             ctx.needs_layout_update = 0;
             zoom_level = 1.0f;
             int max_i = MAX_SIZE - 2 * BORDER;
-            float sc  = 1.0f;
-            if (ctx.w > max_i || ctx.h > max_i) {
-                float sx = (float)max_i / ctx.w;
-                float sy = (float)max_i / ctx.h;
-                sc = sx < sy ? sx : sy;
-            }
+            float sx = (float)max_i / ctx.w;
+            float sy = (float)max_i / ctx.h;
+            float sc = sx < sy ? sx : sy;
             base_draw_w = (int)(ctx.w * sc);
             base_draw_h = (int)(ctx.h * sc);
             draw_w = base_draw_w;
@@ -343,10 +364,19 @@ int main(int argc, char *argv[]) {
             dst.h  = draw_h;
             bot_y  = BORDER + draw_h + (BORDER - 13) / 2.0f;
             SDL_SetWindowSize(ctx.win, win_w, win_h);
+            SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         }
 
-        SDL_SetRenderDrawColor(ctx.ren, 0, 0, 0, 255);
+        SDL_SetRenderDrawColor(ctx.ren, bg_r, bg_g, bg_b, 255);
         SDL_RenderClear(ctx.ren);
+        if (fullscreen) {
+            int aw, ah;
+            SDL_GetWindowSize(ctx.win, &aw, &ah);
+            SDL_Rect vp = { (aw - win_w) / 2, (ah - win_h) / 2, win_w, win_h };
+            SDL_RenderSetViewport(ctx.ren, &vp);
+        } else {
+            SDL_RenderSetViewport(ctx.ren, NULL);
+        }
         SDL_Rect safe = { BORDER, BORDER, win_w - 2 * BORDER, win_h - 2 * BORDER };
         SDL_RenderSetClipRect(ctx.ren, &safe);
         if (mirror_mode && draw_w > 0 && draw_h > 0) {
