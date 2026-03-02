@@ -1,5 +1,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "vendor/stb_image.h"
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "vendor/stb_image_write.h"
 #define STB_EASY_FONT_IMPLEMENTATION
 #include "vendor/stb_easy_font.h"
 #ifdef _WIN32
@@ -17,6 +19,8 @@
 #include "license.h"
 #include "render.h"
 
+#define BOGOSHOP_VERSION "0.1.2_PRE_RELEASE"
+
 #ifdef _WIN32
 static int open_file_dialog(char *out, int out_size) {
     OPENFILENAMEA ofn = {0};
@@ -28,6 +32,19 @@ static int open_file_dialog(char *out, int out_size) {
     ofn.lpstrTitle    = "Open File";
     out[0]            = '\0';
     return GetOpenFileNameA(&ofn);
+}
+
+static int save_file_dialog(char *out, int out_size) {
+    OPENFILENAMEA ofn = {0};
+    ofn.lStructSize   = sizeof(ofn);
+    ofn.lpstrFilter   = "PNG\0*.png\0JPEG\0*.jpg;*.jpeg\0BMP\0*.bmp\0";
+    ofn.lpstrFile     = out;
+    ofn.nMaxFile      = out_size;
+    ofn.lpstrDefExt   = "png";
+    ofn.Flags         = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.lpstrTitle    = "Export als...";
+    out[0]            = '\0';
+    return GetSaveFileNameA(&ofn);
 }
 #endif
 
@@ -87,6 +104,7 @@ int main(int argc, char *argv[]) {
 #ifdef _WIN32
     char dialog_path[MAX_PATH] = {0};
 #endif
+    printf("Bogoshop v%s launched\n", BOGOSHOP_VERSION); fflush(stdout);
 
     /* ── Lizenz prüfen ── */
     if (!load_license()) {
@@ -115,8 +133,59 @@ int main(int argc, char *argv[]) {
 #endif
     }
 
+    /* Dateipfad für Speichern merken */
+    static char current_path[MAX_PATH];
+    strncpy(current_path, argv[1], sizeof(current_path) - 1);
+
+    /* ── Sicherheitskopie in %APPDATA%\bogoshop\ anlegen ── */
+#ifdef _WIN32
+    {
+        const char *appdata = getenv("APPDATA");
+        if (appdata) {
+            char backup_dir[MAX_PATH];
+            snprintf(backup_dir, sizeof(backup_dir), "%s\\bogoshop", appdata);
+            CreateDirectoryA(backup_dir, NULL); /* ignoriert Fehler wenn Ordner existiert */
+
+            /* Dateiname aus Pfad extrahieren */
+            const char *fname = strrchr(current_path, '\\');
+            fname = fname ? fname + 1 : current_path;
+
+            /* Zufälligen 8-stelligen Hex-Suffix generieren */
+            unsigned int rnd = (unsigned int)(GetTickCount() ^ (uintptr_t)fname);
+            rnd ^= rnd << 13; rnd ^= rnd >> 17; rnd ^= rnd << 5;
+
+            /* Suffix vor der Extension einfügen: backup_img_2_A3F20B1C.jpg */
+            const char *dot = strrchr(fname, '.');
+            char backup_path[MAX_PATH];
+            if (dot) {
+                char stem[MAX_PATH];
+                int stem_len = (int)(dot - fname);
+                snprintf(stem, sizeof(stem), "%.*s", stem_len, fname);
+                snprintf(backup_path, sizeof(backup_path),
+                         "%s\\backup_%s_%08X%s", backup_dir, stem, rnd, dot);
+            } else {
+                snprintf(backup_path, sizeof(backup_path),
+                         "%s\\backup_%s_%08X", backup_dir, fname, rnd);
+            }
+
+            /* Binär kopieren */
+            FILE *src = fopen(current_path, "rb");
+            FILE *dst_f = fopen(backup_path, "wb");
+            if (src && dst_f) {
+                char buf[65536];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
+                    fwrite(buf, 1, n, dst_f);
+                printf("Backup: %s\n", backup_path); fflush(stdout);
+            }
+            if (src)   fclose(src);
+            if (dst_f) fclose(dst_f);
+        }
+    }
+#endif
+
     int channels;
-    ctx.pixels = stbi_load(argv[1], &ctx.w, &ctx.h, &channels, 4);
+    ctx.pixels = stbi_load(current_path, &ctx.w, &ctx.h, &channels, 4);
     if (!ctx.pixels) {
         fprintf(stderr, "Image failed to load: %s\n", stbi_failure_reason());
         return 1;
@@ -133,7 +202,7 @@ int main(int argc, char *argv[]) {
     ctx.undo_count = 0;
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        fprintf(stderr, "SDL Init fehlgeschlagen: %s\n", SDL_GetError());
+        fprintf(stderr, "SDL Init failed: %s\n", SDL_GetError());
         stbi_image_free(ctx.pixels);
         return 1;
     }
@@ -141,6 +210,8 @@ int main(int argc, char *argv[]) {
     float zoom_level  = 1.0f;
     int   mirror_mode = 0;
     int   fullscreen  = 0;
+    int   pending_save = 0;
+    int   pending_quit = 0;
     Uint8 bg_r = 0, bg_g = 0, bg_b = 0;
     int max_img = MAX_SIZE - 2 * BORDER;
     float scale = 1.0f;
@@ -157,8 +228,10 @@ int main(int argc, char *argv[]) {
     int win_w = draw_w + 2 * BORDER;
     int win_h = draw_h + 2 * BORDER;
 
+    char win_title[MAX_PATH + 64];
+    snprintf(win_title, sizeof(win_title), "Bogoshop v" BOGOSHOP_VERSION, argv[1]);
     SDL_Window *win = SDL_CreateWindow(
-        argv[1], SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, 0
+        win_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, 0
     );
     apply_window_icon(win);
     ctx.ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
@@ -174,7 +247,7 @@ int main(int argc, char *argv[]) {
     char input[8] = {0};
     int  input_len       = 0;
     int  input_confirmed = 0;   /* 1 = Enter wurde gedrückt, Wert wird gehalten */
-    char last_effect[32] = {0}; /* Name des zuletzt angewendeten Effekts */
+    char last_effect[128] = {0}; /* Name des zuletzt angewendeten Effekts */
 
     SDL_Event e;
     int running = 1;
@@ -185,8 +258,17 @@ int main(int argc, char *argv[]) {
             if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
 
-                if (k == SDLK_ESCAPE) {
-                    running = 0;
+                if (k == SDLK_ESCAPE || k == SDLK_q) {
+                    if (pending_quit) {
+                        running = 0; /* zweites Q/ESC → force quit */
+                    } else {
+                        pending_quit  = 1;
+                        pending_save  = 0;
+                        input_len     = 0; input[0] = '\0';
+                        snprintf(last_effect, sizeof(last_effect),
+                                 "Quit? S = save & quit  E = export & quit  Q/ESC = force quit");
+                        input_confirmed = 1;
+                    }
                 } else if (k == SDLK_r) {
                     zoom_level  = 1.0f;
                     mirror_mode = 0;
@@ -202,6 +284,23 @@ int main(int argc, char *argv[]) {
                 } else if (k == SDLK_BACKSPACE && input_len > 0) {
                     input[--input_len] = '\0';
                     input_confirmed    = 0;
+                } else if (pending_save && (k == SDLK_y)) {
+                    pending_save = 0;
+                    const char *ext = strrchr(current_path, '.');
+                    int ok = 0;
+                    if (ext && (_stricmp(ext, ".jpg") == 0 || _stricmp(ext, ".jpeg") == 0))
+                        ok = stbi_write_jpg(current_path, ctx.w, ctx.h, 4, ctx.pixels, 92);
+                    else if (ext && _stricmp(ext, ".bmp") == 0)
+                        ok = stbi_write_bmp(current_path, ctx.w, ctx.h, 4, ctx.pixels);
+                    else
+                        ok = stbi_write_png(current_path, ctx.w, ctx.h, 4, ctx.pixels, ctx.w * 4);
+                    snprintf(last_effect, sizeof(last_effect),
+                             ok ? "Saved!" : "Save failed");
+                    input_confirmed = 1;
+                } else if (pending_save && (k == SDLK_n)) {
+                    pending_save = 0;
+                    snprintf(last_effect, sizeof(last_effect), "Save cancelled");
+                    input_confirmed = 1;
                 } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
                     if (input_len > 0) {
                         char *sep = strchr(input, ':');
@@ -314,6 +413,54 @@ int main(int argc, char *argv[]) {
                     snprintf(last_effect, sizeof(last_effect),
                              "BG #%02X%02X%02X", bg_r, bg_g, bg_b);
                     input_confirmed = 1; input_len = 0; input[0] = '\0';
+                } else if (k == SDLK_s) {
+                    if (pending_quit) {
+                        /* Direkt speichern und beenden */
+                        pending_quit = 0;
+                        const char *ext = strrchr(current_path, '.');
+                        int ok = 0;
+                        if (ext && (_stricmp(ext, ".jpg") == 0 || _stricmp(ext, ".jpeg") == 0))
+                            ok = stbi_write_jpg(current_path, ctx.w, ctx.h, 4, ctx.pixels, 92);
+                        else if (ext && _stricmp(ext, ".bmp") == 0)
+                            ok = stbi_write_bmp(current_path, ctx.w, ctx.h, 4, ctx.pixels);
+                        else
+                            ok = stbi_write_png(current_path, ctx.w, ctx.h, 4, ctx.pixels, ctx.w * 4);
+                        snprintf(last_effect, sizeof(last_effect),
+                                 ok ? "Saved!" : "Save failed");
+                        input_confirmed = 1;
+                        running = 0;
+                    } else {
+                        /* Normale Speicher-Bestätigung */
+                        pending_save = 1;
+                        const char *fname = strrchr(current_path, '\\');
+                        fname = fname ? fname + 1 : current_path;
+                        snprintf(last_effect, sizeof(last_effect),
+                                 "Overwrite \"%s\"? Y / N", fname);
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    }
+                } else if (k == SDLK_e) {
+                    /* Export: Speicherdialog öffnen */
+                    int was_quit = pending_quit;
+                    pending_quit = 0;
+                    char export_path[MAX_PATH];
+                    strncpy(export_path, current_path, sizeof(export_path) - 1);
+                    if (save_file_dialog(export_path, sizeof(export_path))) {
+                        const char *ext = strrchr(export_path, '.');
+                        int ok = 0;
+                        if (ext && (_stricmp(ext, ".jpg") == 0 || _stricmp(ext, ".jpeg") == 0))
+                            ok = stbi_write_jpg(export_path, ctx.w, ctx.h, 4, ctx.pixels, 92);
+                        else if (ext && _stricmp(ext, ".bmp") == 0)
+                            ok = stbi_write_bmp(export_path, ctx.w, ctx.h, 4, ctx.pixels);
+                        else
+                            ok = stbi_write_png(export_path, ctx.w, ctx.h, 4, ctx.pixels, ctx.w * 4);
+                        snprintf(last_effect, sizeof(last_effect),
+                                 ok ? "Exported!" : "Export failed");
+                        if (was_quit) running = 0;
+                    } else {
+                        snprintf(last_effect, sizeof(last_effect),
+                                 was_quit ? "Quit cancelled" : "Export cancelled");
+                    }
+                    input_confirmed = 1; input_len = 0; input[0] = '\0';
                 } else if (k == SDLK_f) {
                     fullscreen = !fullscreen;
                     SDL_SetWindowFullscreen(ctx.win,
@@ -405,15 +552,11 @@ int main(int argc, char *argv[]) {
         }
         SDL_RenderSetClipRect(ctx.ren, NULL);
         if (mirror_mode) {
-            draw_text(ctx.ren, BORDER + 3, BORDER + 3, "MIRROR", 255, 80, 80);
+            draw_text(ctx.ren, BORDER + 3, BORDER + 3, "MIRROR MODE ACTIVE", 255, 80, 80);
         }
 
         draw_text(ctx.ren, BORDER, (BORDER - 13) / 2.0f, argv[1], 255, 255, 255);
 
-        /* Programmname oben rechts */
-        char *prog_name = "Bogoshop";
-        float prog_x = win_w - BORDER - text_width(prog_name);
-        draw_text(ctx.ren, prog_x, (BORDER - 13) / 2.0f, prog_name, 255, 255, 255);
 
         /* Große zentrierte Zahl über dem Bild während der Eingabe */
         if (input_len > 0) {
@@ -426,7 +569,7 @@ int main(int argc, char *argv[]) {
         }
 
         /* Untere Konsole: Effektname nach Enter, sonst Eingabe-Prompt */
-        char display[48];
+        char display[140];
         Uint8 cr, cg, cb;
         if (input_confirmed && last_effect[0]) {
             snprintf(display, sizeof(display), "> %s", last_effect);
@@ -437,7 +580,12 @@ int main(int argc, char *argv[]) {
             cg = input_len ? 220 : 120;
             cb = input_len ?   0 : 120;
         }
-        draw_text(ctx.ren, BORDER, bot_y, display, cr, cg, cb);
+        {
+            int avail = win_w - 2 * BORDER;
+            int tw    = text_width(display);
+            float sc  = tw > 0 && tw > avail ? (float)avail / tw : 1.0f;
+            draw_text_scaled(ctx.ren, BORDER, bot_y, display, sc, cr, cg, cb);
+        }
 
         SDL_RenderPresent(ctx.ren);
     }

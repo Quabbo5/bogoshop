@@ -37,7 +37,7 @@ void reset_image(void) {
 /* ── U: Letzten Schritt rückgängig machen ────────────────────────────── */
 void undo_last(void) {
     if (ctx.undo_count == 0) {
-        printf("No more undos for you\n"); fflush(stdout);
+        printf("No undo's left\n"); fflush(stdout);
         return;
     }
     int total_bytes = ctx.w * ctx.h * 4;
@@ -302,6 +302,6 @@ const char *on_number_confirmed(int n) {
             return effects[i].name;
         }
     }
-    printf("No function found dumbass hahahhaha\n");
+    printf("No function found\n");
     return NULL;
 }
