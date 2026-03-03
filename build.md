@@ -3,25 +3,36 @@
 ## viewer.exe
 
 Die Quelldateien müssen alle zusammen kompiliert werden:
-- `viewer.c`    — main, Render-Hilfsfunktionen
-- `effects.c`   — nummerierte Bildeffekte + Effekt-Tabelle
-- `functions.c` — Hotkey-Funktionen (reset, undo, crop, composite)
-- `license.c`   — Produktschlüssel, Lizenz-Screen
-- `icon.res`    — eingebettetes App-Icon (aus icon.rc + icon.ico)
+- `src/viewer.c`                  — main, Render-Hilfsfunktionen
+- `src/effects.c`                 — nummerierte Bildeffekte + Effekt-Tabelle
+- `src/functions.c`               — Hotkey-Funktionen (reset, undo, crop, composite)
+- `src/license.c`                 — Produktschlüssel, Lizenz-Screen
+- `vendor/tinyfiledialogs.c`      — nativer Dateidialog (Windows + Mac)
+- `assets/icon.res`               — eingebettetes App-Icon (nur Windows, aus icon.rc + icon.ico)
 
 ### Schritt 1: icon.res generieren (nur einmal nötig, bzw. wenn icon.png geändert wird)
 ```bash
-windres icon.rc -O coff -o icon.res
+windres assets/icon.rc -O coff -o assets/icon.res
 ```
 
-### Debug (mit Konsolenfenster)
+### Debug Windows (mit Konsolenfenster)
 ```bash
-gcc -DSDL_MAIN_HANDLED viewer.c effects.c functions.c license.c icon.res -o viewer.exe -g -O0 -I C:/msys64/mingw64/include -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -mconsole
+gcc -DSDL_MAIN_HANDLED src/viewer.c src/effects.c src/functions.c src/license.c vendor/tinyfiledialogs.c assets/icon.res -o viewer.exe -g -O0 -I C:/msys64/mingw64/include -I include/ -I . -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -lole32 -mwindows -mconsole
 ```
 
-### Release (kein Konsolenfenster, optimiert)
+### Release Windows (kein Konsolenfenster, optimiert)
 ```bash
-gcc -DSDL_MAIN_HANDLED viewer.c effects.c functions.c license.c icon.res -o viewer.exe -O2 -s -I C:/msys64/mingw64/include -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -mwindows
+gcc -DSDL_MAIN_HANDLED src/viewer.c src/effects.c src/functions.c src/license.c vendor/tinyfiledialogs.c assets/icon.res -o viewer.exe -O2 -s -I C:/msys64/mingw64/include -I include/ -I . -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -lole32 -mwindows
+```
+
+### Debug Mac
+```bash
+gcc -DSDL_MAIN_HANDLED src/viewer.c src/effects.c src/functions.c src/license.c vendor/tinyfiledialogs.c -o viewer_mac -g -O0 -I/opt/homebrew/include -I include/ -I . -L/opt/homebrew/lib -lSDL2
+```
+
+### Release Mac
+```bash
+gcc -DSDL_MAIN_HANDLED src/viewer.c src/effects.c src/functions.c src/license.c vendor/tinyfiledialogs.c -o viewer_mac -O2 -I/opt/homebrew/include -I include/ -I . -L/opt/homebrew/lib -lSDL2
 ```
 
 ### icon.ico neu generieren (wenn icon.png ausgetauscht wird)
@@ -31,14 +42,14 @@ import struct
 with open('assets/icon.png','rb') as f: png=f.read()
 hdr=struct.pack('<HHH',0,1,1)
 ent=struct.pack('<BBBBHHII',0,0,0,0,1,32,len(png),22)
-open('icon.ico','wb').write(hdr+ent+png)
+open('assets/icon.ico','wb').write(hdr+ent+png)
 "
 ```
 
 ## keygen.exe
 
 ```bash
-gcc keygen.c -o keygen.exe
+gcc src/keygen.c -o keygen.exe
 ```
 
 ### Key generieren

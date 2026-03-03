@@ -1,0 +1,8 @@
+# macOS resource forks
+._*
+.DS_Store
+
+# Build artifacts
+viewer_mac
+viewer_mac.dSYM/
+Bogoshop.app/

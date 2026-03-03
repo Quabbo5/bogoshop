@@ -7,7 +7,11 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <commdlg.h>
+#else
+#define MAX_PATH 4096
+#include <strings.h>
+#define _stricmp strcasecmp
+#include <mach-o/dyld.h>
 #endif
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_syswm.h>
@@ -18,19 +22,26 @@
 #include "effects.h"
 #include "license.h"
 #include "render.h"
+#include "vendor/tinyfiledialogs.h"
 
-#define BOGOSHOP_VERSION "0.1.2_PRE_RELEASE"
+#define BOGOSHOP_VERSION "0.2.0_PRE_RELEASE"
 
 #define HELP_MAX_LINES 512
 #define HELP_LINE_LEN  256
 
-/* Gibt den Ordner der laufenden .exe zurück (mit trailing backslash) */
+/* Gibt den Ordner der laufenden .exe zurück (mit trailing Slash) */
 static void get_exe_dir(char *out, int out_size) {
     out[0] = '\0';
 #ifdef _WIN32
     char exe[MAX_PATH];
     GetModuleFileNameA(NULL, exe, sizeof(exe));
     char *last = strrchr(exe, '\\');
+    if (last) { *(last + 1) = '\0'; strncpy(out, exe, out_size - 1); }
+#else
+    char exe[MAX_PATH];
+    uint32_t size = (uint32_t)sizeof(exe);
+    if (_NSGetExecutablePath(exe, &size) != 0) return;
+    char *last = strrchr(exe, '/');
     if (last) { *(last + 1) = '\0'; strncpy(out, exe, out_size - 1); }
 #endif
 }
@@ -53,32 +64,23 @@ static int load_help(const char *rel_path, char lines[][HELP_LINE_LEN], int max)
     return n;
 }
 
-#ifdef _WIN32
 static int open_file_dialog(char *out, int out_size) {
-    OPENFILENAMEA ofn = {0};
-    ofn.lStructSize   = sizeof(ofn);
-    ofn.lpstrFilter   = "Bilder\0*.png;*.jpg;*.jpeg;*.bmp\0Alle Dateien\0*.*\0";
-    ofn.lpstrFile     = out;
-    ofn.nMaxFile      = out_size;
-    ofn.Flags         = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-    ofn.lpstrTitle    = "Open File";
-    out[0]            = '\0';
-    return GetOpenFileNameA(&ofn);
+    static const char *filters[] = {"*.png", "*.jpg", "*.jpeg", "*.bmp"};
+    const char *result = tinyfd_openFileDialog("Open File", "", 4, filters, "Bilder", 0);
+    if (!result) return 0;
+    strncpy(out, result, out_size - 1);
+    out[out_size - 1] = '\0';
+    return 1;
 }
 
 static int save_file_dialog(char *out, int out_size) {
-    OPENFILENAMEA ofn = {0};
-    ofn.lStructSize   = sizeof(ofn);
-    ofn.lpstrFilter   = "PNG\0*.png\0JPEG\0*.jpg;*.jpeg\0BMP\0*.bmp\0";
-    ofn.lpstrFile     = out;
-    ofn.nMaxFile      = out_size;
-    ofn.lpstrDefExt   = "png";
-    ofn.Flags         = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-    ofn.lpstrTitle    = "Export als...";
-    out[0]            = '\0';
-    return GetSaveFileNameA(&ofn);
+    static const char *filters[] = {"*.png", "*.jpg", "*.jpeg", "*.bmp"};
+    const char *result = tinyfd_saveFileDialog("Export als...", out, 4, filters, "Bilder");
+    if (!result) return 0;
+    strncpy(out, result, out_size - 1);
+    out[out_size - 1] = '\0';
+    return 1;
 }
-#endif
 
 /* Render text normal */
 void draw_text(SDL_Renderer *ren, float x, float y, const char *text,
@@ -119,6 +121,7 @@ int text_width(const char *text) {
     return stb_easy_font_width((char *)text);
 }
 
+#ifdef _WIN32
 static void apply_window_icon(SDL_Window *win) {
     SDL_SysWMinfo wm;
     SDL_VERSION(&wm.version);
@@ -131,11 +134,26 @@ static void apply_window_icon(SDL_Window *win) {
     if (big)    SendMessage(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)big);
     if (small_) SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)small_);
 }
+static void force_foreground(SDL_Window *win) {
+    SDL_SysWMinfo wm;
+    SDL_VERSION(&wm.version);
+    if (!SDL_GetWindowWMInfo(win, &wm)) return;
+    HWND hwnd    = wm.info.win.window;
+    HWND fg      = GetForegroundWindow();
+    DWORD fg_tid = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    DWORD my_tid = GetCurrentThreadId();
+    if (fg_tid && fg_tid != my_tid) AttachThreadInput(fg_tid, my_tid, TRUE);
+    SetForegroundWindow(hwnd);
+    BringWindowToTop(hwnd);
+    if (fg_tid && fg_tid != my_tid) AttachThreadInput(fg_tid, my_tid, FALSE);
+}
+#else
+static void apply_window_icon(SDL_Window *win) { (void)win; }
+static void force_foreground(SDL_Window *win) { SDL_RaiseWindow(win); }
+#endif
 
 int main(int argc, char *argv[]) {
-#ifdef _WIN32
     char dialog_path[MAX_PATH] = {0};
-#endif
     printf("Bogoshop v%s launched\n", BOGOSHOP_VERSION); fflush(stdout);
 
     /* ── Lizenz prüfen ── */
@@ -146,6 +164,7 @@ int main(int argc, char *argv[]) {
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 480, 320, 0);
         apply_window_icon(lwin);
+        force_foreground(lwin);
         SDL_Renderer *lren = SDL_CreateRenderer(lwin, -1, SDL_RENDERER_ACCELERATED);
         int ok = show_license_screen(lwin, lren);
         SDL_DestroyRenderer(lren);
@@ -155,14 +174,9 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc < 2) {
-#ifdef _WIN32
         if (!open_file_dialog(dialog_path, sizeof(dialog_path)))
             return 0;
         argv[1] = dialog_path;
-#else
-        fprintf(stderr, "Usage: %s <bilddatei>\n", argv[0]);
-        return 1;
-#endif
     }
 
     /* Dateipfad für Speichern merken */
@@ -261,11 +275,12 @@ int main(int argc, char *argv[]) {
     int win_h = draw_h + 2 * BORDER;
 
     char win_title[MAX_PATH + 64];
-    snprintf(win_title, sizeof(win_title), "Bogoshop v" BOGOSHOP_VERSION, argv[1]);
+    snprintf(win_title, sizeof(win_title), "Bogoshop v" BOGOSHOP_VERSION);
     SDL_Window *win = SDL_CreateWindow(
         win_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, 0
     );
     apply_window_icon(win);
+    force_foreground(win);
     ctx.ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     ctx.win = win;
     ctx.tex = SDL_CreateTexture(
@@ -529,13 +544,14 @@ int main(int argc, char *argv[]) {
                         /* Normale Speicher-Bestätigung */
                         pending_save = 1;
                         const char *fname = strrchr(current_path, '\\');
+                        if (!fname) fname = strrchr(current_path, '/');
                         fname = fname ? fname + 1 : current_path;
                         snprintf(last_effect, sizeof(last_effect),
                                  "Overwrite \"%s\"? Y / N", fname);
                         input_confirmed = 1; input_len = 0; input[0] = '\0';
                     }
                 } else if (k == SDLK_e) {
-                    /* Export: Speicherdialog öffnen */
+                    /* Export: nativer Speicherdialog via tinyfiledialogs */
                     int was_quit = pending_quit;
                     pending_quit = 0;
                     char export_path[MAX_PATH];

@@ -1,6 +1,9 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#else
+#define MAX_PATH 4096
+#include <sys/stat.h>
 #endif
 
 #include <SDL2/SDL.h>
@@ -57,8 +60,14 @@ int validate_key(const char *key) {
 
 int load_license(void) {
     char path[MAX_PATH];
+#ifdef _WIN32
     if (!GetEnvironmentVariableA("APPDATA", path, sizeof(path))) return 0;
     strncat(path, "\\bogoshop\\license.key", sizeof(path) - strlen(path) - 1);
+#else
+    const char *home = getenv("HOME");
+    if (!home) return 0;
+    snprintf(path, sizeof(path), "%s/.config/bogoshop/license.key", home);
+#endif
     FILE *f = fopen(path, "r");
     if (!f) return 0;
     char key[32] = {0};
@@ -71,10 +80,18 @@ int load_license(void) {
 
 void save_license(const char *key) {
     char dir[MAX_PATH], path[MAX_PATH];
+#ifdef _WIN32
     if (!GetEnvironmentVariableA("APPDATA", dir, sizeof(dir))) return;
     snprintf(path, sizeof(path), "%s\\bogoshop", dir);
     CreateDirectoryA(path, NULL); /* ignoriert Fehler falls schon vorhanden */
     snprintf(path, sizeof(path), "%s\\bogoshop\\license.key", dir);
+#else
+    const char *home = getenv("HOME");
+    if (!home) return;
+    snprintf(dir, sizeof(dir), "%s/.config/bogoshop", home);
+    mkdir(dir, 0755); /* ignoriert Fehler falls schon vorhanden */
+    snprintf(path, sizeof(path), "%s/license.key", dir);
+#endif
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "%s\n", key);
