@@ -1,6 +1,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <winhttp.h>   /* Online-Verify via WinHTTP — link with -lwinhttp */
 #else
 #define MAX_PATH 4096
 #include <sys/stat.h>
@@ -10,10 +11,21 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
 #include "vendor/stb_easy_font.h"
 #include "license.h"
 #include "render.h"
+
+/* ── Railway API ──────────────────────────────────────────────────────────
+   TODO: Nach dem Railway-Deploy diese URL durch die echte ersetzen.
+   Beispiel: L"bogoshop-api.up.railway.app"
+   ──────────────────────────────────────────────────────────────────────── */
+#define RAILWAY_HOST    L"YOUR-APP.up.railway.app"
+#define RAILWAY_PATH    L"/verify"
+
+/* Offline-Gnadenfrist: 7 Tage in Sekunden */
+#define OFFLINE_GRACE_SEC (7 * 24 * 3600)
 
 /* ══════════════════════════════════════════════════════════════════════════
    LICENSE / PRODUCT-KEY SYSTEM
@@ -31,6 +43,111 @@ static int key_char_to_val(char c) {
         if (KEY_ALPHA[i] == (char)toupper((unsigned char)c)) return i;
     return -1;
 }
+
+/* ── Machine-ID: Volume-Seriennummer von C:\ (stabil, eindeutig) ─────── */
+#ifdef _WIN32
+static void get_machine_id(char out[16]) {
+    DWORD serial = 0;
+    GetVolumeInformationA("C:\\", NULL, 0, &serial, NULL, NULL, NULL, 0);
+    snprintf(out, 16, "%08lX", (unsigned long)serial);
+}
+#else
+static void get_machine_id(char out[16]) {
+    /* Mac/Linux: einfacher Fallback, erweiterbar */
+    strncpy(out, "UNKNOWN00000000", 16);
+}
+#endif
+
+/* ── Online-Verification via Railway API ─────────────────────────────── */
+/* Gibt  1 zurück wenn Server "valid":true meldet,
+         0 wenn Server "valid":false meldet,
+        -1 wenn kein Netz / Timeout (Offline-Fallback greift) */
+#ifdef _WIN32
+static int online_verify_key(const char *key) {
+    char machine_id[16];
+    get_machine_id(machine_id);
+
+    /* JSON-Body bauen */
+    char body[128];
+    snprintf(body, sizeof(body),
+             "{\"key\":\"%s\",\"machine_id\":\"%s\"}", key, machine_id);
+    int body_len = (int)strlen(body);
+
+    int result = -1; /* Standard: Offline */
+
+    HINTERNET hSession = WinHttpOpen(
+        L"bogoshop/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return -1;
+
+    HINTERNET hConn = WinHttpConnect(hSession, RAILWAY_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hConn) { WinHttpCloseHandle(hSession); return -1; }
+
+    HINTERNET hReq = WinHttpOpenRequest(
+        hConn, L"POST", RAILWAY_PATH,
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession); return -1; }
+
+    /* Timeout: 5 Sekunden */
+    DWORD timeout = 5000;
+    WinHttpSetOption(hReq, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    WinHttpSetOption(hReq, WINHTTP_OPTION_RECEIVE_TIMEOUT,  &timeout, sizeof(timeout));
+
+    BOOL sent = WinHttpSendRequest(
+        hReq,
+        L"Content-Type: application/json\r\n",
+        (DWORD)-1,
+        body, body_len, body_len, 0);
+
+    if (sent && WinHttpReceiveResponse(hReq, NULL)) {
+        char resp[256] = {0};
+        DWORD read = 0;
+        WinHttpReadData(hReq, resp, sizeof(resp) - 1, &read);
+        /* Simples Check: enthält die Antwort "true"? */
+        result = (strstr(resp, "\"valid\":true") != NULL) ? 1 : 0;
+    }
+
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConn);
+    WinHttpCloseHandle(hSession);
+    return result;
+}
+#else
+static int online_verify_key(const char *key) {
+    (void)key;
+    return -1; /* Offline-Fallback auf Mac/Linux bis libcurl eingebaut */
+}
+#endif
+
+/* ── Offline-Timestamp aus der gespeicherten Lizenz lesen/schreiben ──── */
+#ifdef _WIN32
+static void save_last_online(void) {
+    char path[MAX_PATH];
+    if (!GetEnvironmentVariableA("APPDATA", path, sizeof(path))) return;
+    strncat(path, "\\bogoshop\\last_ok.txt", sizeof(path) - strlen(path) - 1);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%llu\n", (unsigned long long)time(NULL));
+    fclose(f);
+}
+
+static int offline_grace_ok(void) {
+    char path[MAX_PATH];
+    if (!GetEnvironmentVariableA("APPDATA", path, sizeof(path))) return 0;
+    strncat(path, "\\bogoshop\\last_ok.txt", sizeof(path) - strlen(path) - 1);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long ts = 0;
+    fscanf(f, "%llu", &ts);
+    fclose(f);
+    return ((unsigned long long)time(NULL) - ts) < OFFLINE_GRACE_SEC;
+}
+#else
+static void save_last_online(void) {}
+static int offline_grace_ok(void) { return 0; }
+#endif
 
 int validate_key(const char *key) {
     /* Bindestriche ignorieren, 20 Ziffern einlesen */
@@ -75,7 +192,20 @@ int load_license(void) {
     fclose(f);
     /* Trailing newline entfernen */
     key[strcspn(key, "\r\n")] = '\0';
-    return validate_key(key);
+
+    /* Lokale Struktur muss stimmen (Prüfsumme) */
+    if (!validate_key(key)) return 0;
+
+    /* Online-Check: Server ist die eigentliche Autorität */
+    int online = online_verify_key(key);
+    if (online == 1) {
+        save_last_online(); /* Timestamp für Offline-Gnadenfrist aktualisieren */
+        return 1;
+    }
+    if (online == 0) return 0; /* Server sagt: ungültig/widerrufen */
+
+    /* online == -1: kein Netz — Gnadenfrist prüfen */
+    return offline_grace_ok();
 }
 
 void save_license(const char *key) {
@@ -143,8 +273,15 @@ int show_license_screen(SDL_Window *win, SDL_Renderer *ren) {
                 }
                 if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
                     if (validate_key(input)) {
-                        save_license(input);
-                        state = 1; running = 0; result = 1;
+                        int online = online_verify_key(input);
+                        if (online == 1 || online == -1) {
+                            /* 1 = Server OK, -1 = offline (strukturell OK reicht für Erstaktivierung) */
+                            if (online == 1) save_last_online();
+                            save_license(input);
+                            state = 1; running = 0; result = 1;
+                        } else {
+                            state = 2; /* Server: ungültig oder max Geräte erreicht */
+                        }
                     } else {
                         state = 2;
                     }

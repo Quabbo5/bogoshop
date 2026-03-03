@@ -17,12 +17,12 @@ windres assets/icon.rc -O coff -o assets/icon.res
 
 ### Debug Windows (mit Konsolenfenster)
 ```bash
-gcc -DSDL_MAIN_HANDLED src/viewer.c src/effects.c src/functions.c src/license.c vendor/tinyfiledialogs.c assets/icon.res -o viewer.exe -g -O0 -I C:/msys64/mingw64/include -I include/ -I . -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -lole32 -mwindows -mconsole
+gcc -DSDL_MAIN_HANDLED src/viewer.c src/effects.c src/functions.c src/license.c vendor/tinyfiledialogs.c assets/icon.res -o viewer.exe -g -O0 -I C:/msys64/mingw64/include -I include/ -I . -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -lole32 -lwinhttp -mwindows -mconsole
 ```
 
 ### Release Windows (kein Konsolenfenster, optimiert)
 ```bash
-gcc -DSDL_MAIN_HANDLED src/viewer.c src/effects.c src/functions.c src/license.c vendor/tinyfiledialogs.c assets/icon.res -o viewer.exe -O2 -s -I C:/msys64/mingw64/include -I include/ -I . -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -lole32 -mwindows
+gcc -DSDL_MAIN_HANDLED src/viewer.c src/effects.c src/functions.c src/license.c vendor/tinyfiledialogs.c assets/icon.res -o viewer.exe -O2 -s -I C:/msys64/mingw64/include -I include/ -I . -L C:/msys64/mingw64/lib -lSDL2 -lcomdlg32 -lole32 -lwinhttp -mwindows
 ```
 
 ### Debug Mac
