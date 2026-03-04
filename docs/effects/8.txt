@@ -1,0 +1,21 @@
+# Rainbow-Overlay-Top-To-Bottom  [Effect 8]
+
+Applies a rainbow colour overlay across the image from top to bottom
+using a screen blend - red at the top fading through orange, yellow,
+green, blue and into violet at the bottom.
+
+## Usage
+
+Type  8  and press ENTER to apply with default settings.
+
+## How it works
+
+1. Each row is mapped to a hue between 0 deg (red) and 270 deg (violet)
+2. The hue is converted to a full-saturation RGB colour
+3. That colour is screen-blended onto the original pixel:
+   result = 1 - (1 - source) * (1 - overlay)
+4. Screen blend brightens and tints without losing detail
+
+## Notes
+
+- Apply multiple times to intensify the rainbow colours.

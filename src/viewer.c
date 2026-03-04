@@ -7,6 +7,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <commdlg.h>
 #else
 #define MAX_PATH 4096
 #include <strings.h>
@@ -74,12 +75,33 @@ static int open_file_dialog(char *out, int out_size) {
 }
 
 static int save_file_dialog(char *out, int out_size) {
+#ifdef _WIN32
+    wchar_t wpath[MAX_PATH] = {0};
+    MultiByteToWideChar(CP_ACP, 0, out, -1, wpath, MAX_PATH);
+    OPENFILENAMEW ofn;
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter =
+        L"PNG Image (*.png)\0*.png\0"
+        L"JPEG Image (*.jpg)\0*.jpg;*.jpeg\0"
+        L"Bitmap (*.bmp)\0*.bmp\0";
+    ofn.nFilterIndex = 1;   /* default: PNG */
+    ofn.lpstrFile    = wpath;
+    ofn.nMaxFile     = MAX_PATH;
+    ofn.lpstrTitle   = L"Export als...";
+    ofn.Flags        = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt  = L"png";
+    if (!GetSaveFileNameW(&ofn)) return 0;
+    WideCharToMultiByte(CP_ACP, 0, wpath, -1, out, out_size, NULL, NULL);
+    return 1;
+#else
     static const char *filters[] = {"*.png", "*.jpg", "*.jpeg", "*.bmp"};
     const char *result = tinyfd_saveFileDialog("Export als...", out, 4, filters, "Bilder");
     if (!result) return 0;
     strncpy(out, result, out_size - 1);
     out[out_size - 1] = '\0';
     return 1;
+#endif
 }
 
 /* Render text normal */
@@ -151,6 +173,209 @@ static void force_foreground(SDL_Window *win) {
 static void apply_window_icon(SDL_Window *win) { (void)win; }
 static void force_foreground(SDL_Window *win) { SDL_RaiseWindow(win); }
 #endif
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Effect Popup — embedded panel, main window expands to the right
+   ══════════════════════════════════════════════════════════════════════════ */
+#define POPUP_W           280  /* panel width added to the right of the main window */
+#define POPUP_PREVIEW_MAX 512  /* max dimension of fast-preview downsample */
+
+/* ── State ───────────────────────────────────────────────────────────── */
+/* popup_cur: mutable copy of a const Effect entry (param values adjusted by user) */
+static int            popup_active   = 0;
+static int            popup_sel      = 0;
+static int            popup_panel_x  = 0;    /* x where panel begins */
+static Effect         popup_cur;
+static unsigned char *popup_saved_px   = NULL; /* full-res pixel backup */
+static unsigned char *popup_preview_px = NULL; /* downscaled px for fast preview */
+static unsigned char *popup_preview_og = NULL; /* backup of downscaled orig */
+static SDL_Texture   *popup_preview_tex = NULL;
+static int            popup_preview_w  = 0;
+static int            popup_preview_h  = 0;
+
+/* Returns 1 if effect n has a popup (param_count > 0) */
+static int popup_has_template(int n) {
+    const Effect *e = get_effect(n);
+    return e != NULL && e->param_count > 0;
+}
+
+/* Nearest-neighbour downscale for fast preview buffer */
+static void popup_downscale(const unsigned char *src, int sw, int sh,
+                             unsigned char *dst, int dw, int dh) {
+    for (int y = 0; y < dh; y++) {
+        int sy = y * sh / dh;
+        for (int x = 0; x < dw; x++) {
+            int sx = x * sw / dw;
+            const unsigned char *sp = src + (sy * sw + sx) * 4;
+            unsigned char       *dp = dst + (y  * dw + x ) * 4;
+            dp[0]=sp[0]; dp[1]=sp[1]; dp[2]=sp[2]; dp[3]=sp[3];
+        }
+    }
+}
+
+/* Build params int-array from current popup_cur values */
+static void popup_collect_vals(int *vals) {
+    for (int i = 0; i < popup_cur.param_count; i++)
+        vals[i] = popup_cur.params[i].value;
+}
+
+/* Apply effect for preview.
+   Uses the small downscaled buffer if available (fast), else falls back to
+   full-res (correct for small images where no downscale was needed). */
+static void popup_apply_preview(void) {
+    if (!popup_saved_px) return;
+    int vals[EFFECT_MAX_PARAMS];
+    popup_collect_vals(vals);
+
+    if (popup_preview_px && popup_preview_og && popup_preview_tex) {
+        /* Fast path: apply on small buffer only */
+        int small_bytes = popup_preview_w * popup_preview_h * 4;
+        memcpy(popup_preview_px, popup_preview_og, (size_t)small_bytes);
+
+        /* Temporarily swap ctx to small buffer so effect functions work */
+        unsigned char *sv_px  = ctx.pixels;
+        int            sv_w   = ctx.w,  sv_h = ctx.h;
+        SDL_Texture   *sv_tex = ctx.tex;
+
+        ctx.pixels = popup_preview_px;
+        ctx.w      = popup_preview_w;
+        ctx.h      = popup_preview_h;
+        ctx.tex    = popup_preview_tex;
+        ctx.preview_mode = 1;
+
+        apply_effect_params(popup_cur.id, vals, popup_cur.param_count);
+
+        ctx.pixels = sv_px;
+        ctx.w      = sv_w;
+        ctx.h      = sv_h;
+        ctx.tex    = sv_tex;
+        ctx.preview_mode = 1; /* keep set so undo is suppressed */
+    } else {
+        /* Fallback: full-res apply (small image, no downscale needed) */
+        memcpy(ctx.pixels, popup_saved_px, (size_t)ctx.w * ctx.h * 4);
+        ctx.preview_mode = 1;
+        apply_effect_params(popup_cur.id, vals, popup_cur.param_count);
+    }
+}
+
+/* Draw the right-side panel onto the main renderer */
+static void popup_render(SDL_Renderer *ren, int win_h) {
+    if (!popup_active || !ren) return;
+
+    /* Dark panel background */
+    SDL_SetRenderDrawColor(ren, 18, 18, 24, 255);
+    SDL_Rect panel = { popup_panel_x, 0, POPUP_W, win_h };
+    SDL_RenderFillRect(ren, &panel);
+
+    /* Left border */
+    SDL_SetRenderDrawColor(ren, 60, 60, 80, 255);
+    SDL_RenderDrawLine(ren, popup_panel_x, 0, popup_panel_x, win_h);
+
+    int x  = popup_panel_x + 14;
+    int xe = popup_panel_x + POPUP_W - 14;
+    int y  = BORDER;
+
+    /* Title */
+    draw_text(ren, x, y, popup_cur.name, 255, 220, 60);
+    y += 22;
+    SDL_SetRenderDrawColor(ren, 55, 55, 70, 255);
+    SDL_RenderDrawLine(ren, x, y, xe, y);
+    y += 14;
+
+    /* Params */
+    for (int i = 0; i < popup_cur.param_count; i++) {
+        EffectParam *p = &popup_cur.params[i];
+        int sel = (i == popup_sel);
+
+        /* Label line */
+        char lbuf[48];
+        snprintf(lbuf, sizeof(lbuf), "%d  %s", i + 1, p->label);
+        draw_text(ren, x, y, lbuf,
+                  sel ? 255 : 140, sel ? 220 : 140, sel ? 60 : 140);
+        y += 15;
+
+        /* Bar + value */
+        int bar_w = xe - x - 32;
+        int fill  = bar_w * p->value / (p->max_val > 0 ? p->max_val : 1);
+        SDL_SetRenderDrawColor(ren, 35, 35, 50, 255);
+        SDL_Rect bg = { x, y, bar_w, 7 };
+        SDL_RenderFillRect(ren, &bg);
+        if (fill > 0) {
+            SDL_SetRenderDrawColor(ren, sel ? 90:50, sel ? 180:110, sel ? 60:40, 255);
+            SDL_Rect fg = { x, y, fill, 7 };
+            SDL_RenderFillRect(ren, &fg);
+        }
+        char vbuf[12];
+        snprintf(vbuf, sizeof(vbuf), "%d", p->value);
+        draw_text(ren, x + bar_w + 4, y - 2, vbuf, 190, 190, 190);
+        y += 20;
+    }
+
+    y += 10;
+    SDL_SetRenderDrawColor(ren, 55, 55, 70, 255);
+    SDL_RenderDrawLine(ren, x, y, xe, y);
+    y += 12;
+
+    draw_text(ren, x, y, "+/-  adjust",  65, 65, 85); y += 14;
+    draw_text(ren, x, y, "1-8  select",  65, 65, 85); y += 14;
+    draw_text(ren, x, y, "ENTER  apply", 65, 65, 85); y += 14;
+    draw_text(ren, x, y, "ESC  cancel",  65, 65, 85); y += 14;
+    draw_text(ren, x, y, "This is the demo preview.",  65, 65, 85);
+}
+
+/* Free all popup preview resources (call before closing popup) */
+static void popup_free_preview(void) {
+    if (popup_preview_px)  { free(popup_preview_px);  popup_preview_px  = NULL; }
+    if (popup_preview_og)  { free(popup_preview_og);  popup_preview_og  = NULL; }
+    if (popup_preview_tex) { SDL_DestroyTexture(popup_preview_tex); popup_preview_tex = NULL; }
+    popup_preview_w = popup_preview_h = 0;
+}
+
+/* Open panel: save pixels, build downscaled preview, expand window */
+static void popup_open(int effect_id, SDL_Window *win, int win_w, int win_h) {
+    const Effect *tmpl = get_effect(effect_id);
+    if (!tmpl || tmpl->param_count == 0) return;
+
+    popup_cur = *tmpl; /* mutable working copy */
+    popup_sel = 0;
+
+    int nb = ctx.w * ctx.h * 4;
+    popup_saved_px = malloc((size_t)nb);
+    if (!popup_saved_px) return;
+    memcpy(popup_saved_px, ctx.pixels, (size_t)nb);
+
+    /* Build downscaled buffer for fast preview (only if image is large) */
+    popup_free_preview();
+    if (ctx.w > POPUP_PREVIEW_MAX || ctx.h > POPUP_PREVIEW_MAX) {
+        float sx = (float)POPUP_PREVIEW_MAX / ctx.w;
+        float sy = (float)POPUP_PREVIEW_MAX / ctx.h;
+        float s  = sx < sy ? sx : sy;
+        popup_preview_w = (int)(ctx.w * s);
+        popup_preview_h = (int)(ctx.h * s);
+        if (popup_preview_w < 1) popup_preview_w = 1;
+        if (popup_preview_h < 1) popup_preview_h = 1;
+        int small_bytes = popup_preview_w * popup_preview_h * 4;
+        popup_preview_px  = malloc((size_t)small_bytes);
+        popup_preview_og  = malloc((size_t)small_bytes);
+        if (popup_preview_px && popup_preview_og) {
+            popup_downscale(popup_saved_px, ctx.w, ctx.h,
+                            popup_preview_og, popup_preview_w, popup_preview_h);
+            memcpy(popup_preview_px, popup_preview_og, (size_t)small_bytes);
+            popup_preview_tex = SDL_CreateTexture(ctx.ren,
+                SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING,
+                popup_preview_w, popup_preview_h);
+        } else {
+            popup_free_preview(); /* alloc failed — fall back to full-res */
+        }
+    }
+    /* If image is small enough, popup_preview_tex stays NULL → full-res path */
+
+    popup_panel_x = win_w;
+    SDL_SetWindowSize(win, win_w + POPUP_W, win_h);
+
+    popup_apply_preview();
+    popup_active = 1;
+}
 
 int main(int argc, char *argv[]) {
     char dialog_path[MAX_PATH] = {0};
@@ -258,6 +483,9 @@ int main(int argc, char *argv[]) {
     int   fullscreen  = 0;
     int   pending_save = 0;
     int   pending_quit = 0;
+    int   res_mode         = 0;  /* 0=off  1=canvas resize mode active */
+    int   canvas_fill_mode = 5;  /* 1=Fill 2=Fit 3=Stretch 4=Tile 5=Center 6=Span */
+    int   canvas_submode   = 1;  /* +1=expand  -1=shrink */
     Uint8 bg_r = 0, bg_g = 0, bg_b = 0;
     int max_img = MAX_SIZE - 2 * BORDER;
     float scale = 1.0f;
@@ -274,6 +502,13 @@ int main(int argc, char *argv[]) {
     int win_w = draw_w + 2 * BORDER;
     int win_h = draw_h + 2 * BORDER;
 
+    int comp_w = ctx.w;  /* composition frame width  (can be < ctx.w = virtual shrink) */
+    int comp_h = ctx.h;  /* composition frame height */
+    int comp_dirty = 0;  /* 1 = recalculate layout from comp_w/comp_h */
+    int transform_mode = 0;              /* T = fit original into comp */
+    unsigned char *pre_comp_pixels = NULL; /* pixels saved when entering comp mode */
+    int pre_comp_w = 0, pre_comp_h = 0;
+
     char win_title[MAX_PATH + 64];
     snprintf(win_title, sizeof(win_title), "Bogoshop v" BOGOSHOP_VERSION);
     SDL_Window *win = SDL_CreateWindow(
@@ -281,6 +516,7 @@ int main(int argc, char *argv[]) {
     );
     apply_window_icon(win);
     force_foreground(win);
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1"); /* bilinear filtering beim Zoom */
     ctx.ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     ctx.win = win;
     ctx.tex = SDL_CreateTexture(
@@ -291,7 +527,7 @@ int main(int argc, char *argv[]) {
     SDL_Rect dst   = { BORDER, BORDER, draw_w, draw_h };
     float    bot_y = BORDER + draw_h + (BORDER - 13) / 2.0f;
 
-    char input[8] = {0};
+    char input[16] = {0};
     int  input_len       = 0;
     int  input_confirmed = 0;   /* 1 = Enter wurde gedrückt, Wert wird gehalten */
     char last_effect[128] = {0};
@@ -315,8 +551,57 @@ int main(int argc, char *argv[]) {
             if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
 
+                /* ── Popup panel keys (intercept all input) ────────── */
+                if (popup_active) {
+                    if (k == SDLK_ESCAPE) {
+                        /* cancel: restore original pixels */
+                        if (popup_saved_px) {
+                            memcpy(ctx.pixels, popup_saved_px,
+                                   (size_t)ctx.w * ctx.h * 4);
+                            free(popup_saved_px); popup_saved_px = NULL;
+                        }
+                        ctx.preview_mode = 0;
+                        SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
+                        popup_free_preview();
+                        SDL_SetWindowSize(win, win_w, win_h);
+                        popup_active = 0;
+                    } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                        /* confirm: restore backup then apply full-res (saves undo) */
+                        if (popup_saved_px) {
+                            memcpy(ctx.pixels, popup_saved_px,
+                                   (size_t)ctx.w * ctx.h * 4);
+                            free(popup_saved_px); popup_saved_px = NULL;
+                        }
+                        ctx.preview_mode = 0;
+                        popup_free_preview();
+                        { int vals[EFFECT_MAX_PARAMS];
+                          popup_collect_vals(vals);
+                          apply_effect_params(popup_cur.id, vals, popup_cur.param_count); }
+                        SDL_SetWindowSize(win, win_w, win_h);
+                        popup_active = 0;
+                        snprintf(last_effect, sizeof(last_effect),
+                                 "%s", popup_cur.name);
+                        input_confirmed = 1;
+                    } else if (k == SDLK_EQUALS || k == SDLK_PLUS ||
+                               k == SDLK_KP_PLUS) {
+                        EffectParam *p = &popup_cur.params[popup_sel];
+                        p->value += p->step;
+                        if (p->value > p->max_val) p->value = p->max_val;
+                        popup_apply_preview();
+                    } else if (k == SDLK_MINUS || k == SDLK_KP_MINUS) {
+                        EffectParam *p = &popup_cur.params[popup_sel];
+                        p->value -= p->step;
+                        if (p->value < p->min_val) p->value = p->min_val;
+                        popup_apply_preview();
+                    } else if (k >= SDLK_1 && k <= SDLK_8) {
+                        int idx = k - SDLK_1;
+                        if (idx < popup_cur.param_count) popup_sel = idx;
+                    }
+                } else {
+
 #define HELP_WIN_W 780
 #define HELP_WIN_H 680
+                /* ── Global keys (all non-popup modes) ─────────────────── */
                 if (k == SDLK_h) {
                     if (help_mode) {
                         help_mode = 0;
@@ -380,6 +665,7 @@ int main(int argc, char *argv[]) {
                 } else if (k == SDLK_r) {
                     zoom_level  = 1.0f;
                     mirror_mode = 0;
+                    res_mode    = 0;
                     draw_w = base_draw_w;
                     draw_h = base_draw_h;
                     dst.x  = BORDER;
@@ -387,11 +673,21 @@ int main(int argc, char *argv[]) {
                     dst.w  = draw_w;
                     dst.h  = draw_h;
                     reset_image();
+                    comp_w = ctx.w; comp_h = ctx.h;
+                    transform_mode = 0;
+                    if (pre_comp_pixels) { free(pre_comp_pixels); pre_comp_pixels = NULL; }
+                    pre_comp_w = 0; pre_comp_h = 0;
                 } else if (k == SDLK_u) {
                     undo_last();
                 } else if (k == SDLK_BACKSPACE && input_len > 0) {
                     input[--input_len] = '\0';
                     input_confirmed    = 0;
+                } else if (k == SDLK_f && !(e.key.keysym.mod & (KMOD_CTRL | KMOD_SHIFT))) {
+                    fullscreen = !fullscreen;
+                    SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                    snprintf(last_effect, sizeof(last_effect), fullscreen ? "Fullscreen ON" : "Fullscreen OFF");
+                    input_confirmed = 1; input_len = 0; input[0] = '\0';
                 } else if (pending_save && (k == SDLK_y)) {
                     pending_save = 0;
                     const char *ext = strrchr(current_path, '.');
@@ -409,150 +705,23 @@ int main(int argc, char *argv[]) {
                     pending_save = 0;
                     snprintf(last_effect, sizeof(last_effect), "Save cancelled");
                     input_confirmed = 1;
-                } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
-                    if (input_len > 0) {
-                        char *sep = strchr(input, ':');
-                        if (sep && sep != input && *(sep + 1) != '\0') {
-                            /* Ratio-Format: z.B. "4:3" → crop */
-                            int rw = atoi(input);
-                            int rh = atoi(sep + 1);
-                            if (rw >= 1 && rh >= 1) {
-                                const char *name = crop_aspect(rw, rh);
-                                if (name) snprintf(last_effect, sizeof(last_effect), "%s %d:%d", name, rw, rh);
-                                else      snprintf(last_effect, sizeof(last_effect), "???");
-                            }
-                        } else {
-                            int n = atoi(input);
-                            if (n >= 1 && n <= 1000) {
-                                const char *name = on_number_confirmed(n);
-                                if (name) snprintf(last_effect, sizeof(last_effect), "%s", name);
-                                else      snprintf(last_effect, sizeof(last_effect), "???");
-                            }
-                        }
-                        input_confirmed = 1;   /* Wert bleibt stehen */
-                    }
-                } else if (help_mode && (k == SDLK_UP || k == SDLK_DOWN)) {
-                    if (k == SDLK_UP   && help_scroll > 0) help_scroll--;
-                    if (k == SDLK_DOWN && help_scroll < help_line_count - 1) help_scroll++;
-                } else if (k == SDLK_UP || k == SDLK_DOWN ||
-                           k == SDLK_LEFT || k == SDLK_RIGHT) {
-                    if (mirror_mode || zoom_level > 1.0f) {
-                        /* Viewport pan: dst verschieben (Mirror-Mode oder Zoom > 1) */
-                        int step = mirror_mode && zoom_level <= 1.0f
-                                   ? (draw_w > 4 ? draw_w / 4 : 1)
-                                   : (win_w - 2 * BORDER) / 8;
-                        if (k == SDLK_LEFT)  dst.x += step;
-                        if (k == SDLK_RIGHT) dst.x -= step;
-                        if (k == SDLK_UP)    dst.y += step;
-                        if (k == SDLK_DOWN)  dst.y -= step;
-                        /* Klemmen nur wenn kein Mirror-Mode (Kacheln füllen immer die Lücken) */
-                        if (!mirror_mode) {
-                            int iw = win_w - 2 * BORDER, ih = win_h - 2 * BORDER;
-                            if (draw_w > iw) {
-                                if (dst.x > BORDER)                  dst.x = BORDER;
-                                if (dst.x + draw_w < win_w - BORDER) dst.x = win_w - BORDER - draw_w;
-                            }
-                            if (draw_h > ih) {
-                                if (dst.y > BORDER)                  dst.y = BORDER;
-                                if (dst.y + draw_h < win_h - BORDER) dst.y = win_h - BORDER - draw_h;
-                            }
-                        }
-                    } else {
-                        /* Crop pan: Ausschnitt im Quellbild verschieben */
-                        int sw = ctx.crop_active ? ctx.crop_src_w : 1;
-                        int sh = ctx.crop_active ? ctx.crop_src_h : 1;
-                        int step = sw > sh ? sw / 20 : sh / 20;
-                        if (step < 5) step = 5;
-                        if (k == SDLK_UP)    crop_pan(0,    -step);
-                        if (k == SDLK_DOWN)  crop_pan(0,     step);
-                        if (k == SDLK_LEFT)  crop_pan(-step, 0);
-                        if (k == SDLK_RIGHT) crop_pan( step, 0);
-                    }
-                } else if (k == SDLK_EQUALS || k == SDLK_PLUS || k == SDLK_KP_PLUS) {
-                    { int old_dw = draw_w, old_dh = draw_h;
-                    zoom_level += 0.25f;
-                    if (zoom_level > 4.0f) zoom_level = 4.0f;
-                    draw_w = (int)(base_draw_w * zoom_level);
-                    draw_h = (int)(base_draw_h * zoom_level);
-                    dst.x  = win_w/2 - (win_w/2 - dst.x) * draw_w / old_dw;
-                    dst.y  = win_h/2 - (win_h/2 - dst.y) * draw_h / old_dh;
-                    dst.w  = draw_w;
-                    dst.h  = draw_h;
-                    if (!mirror_mode) {
-                        int iw = win_w-2*BORDER, ih = win_h-2*BORDER;
-                        if (draw_w <= iw) { dst.x = BORDER; }
-                        else { if (dst.x > BORDER) dst.x = BORDER; if (dst.x+draw_w < win_w-BORDER) dst.x = win_w-BORDER-draw_w; }
-                        if (draw_h <= ih) { dst.y = BORDER; }
-                        else { if (dst.y > BORDER) dst.y = BORDER; if (dst.y+draw_h < win_h-BORDER) dst.y = win_h-BORDER-draw_h; }
-                    } }
-                    snprintf(last_effect, sizeof(last_effect), "Zoom %.2fx", zoom_level);
-                    input_confirmed = 1; input_len = 0; input[0] = '\0';
-                } else if (k == SDLK_MINUS || k == SDLK_KP_MINUS) {
-                    { int old_dw = draw_w, old_dh = draw_h;
-                    zoom_level -= 0.25f;
-                    if (!mirror_mode && zoom_level < 1.0f) zoom_level = 1.0f;
-                    if (zoom_level < 0.25f) zoom_level = 0.25f;
-                    draw_w = (int)(base_draw_w * zoom_level);
-                    draw_h = (int)(base_draw_h * zoom_level);
-                    dst.x  = win_w/2 - (win_w/2 - dst.x) * draw_w / old_dw;
-                    dst.y  = win_h/2 - (win_h/2 - dst.y) * draw_h / old_dh;
-                    dst.w  = draw_w;
-                    dst.h  = draw_h;
-                    if (!mirror_mode) {
-                        int iw = win_w-2*BORDER, ih = win_h-2*BORDER;
-                        if (draw_w <= iw) { dst.x = BORDER; }
-                        else { if (dst.x > BORDER) dst.x = BORDER; if (dst.x+draw_w < win_w-BORDER) dst.x = win_w-BORDER-draw_w; }
-                        if (draw_h <= ih) { dst.y = BORDER; }
-                        else { if (dst.y > BORDER) dst.y = BORDER; if (dst.y+draw_h < win_h-BORDER) dst.y = win_h-BORDER-draw_h; }
-                    } }
-                    snprintf(last_effect, sizeof(last_effect), "Zoom %.2fx", zoom_level);
-                    input_confirmed = 1; input_len = 0; input[0] = '\0';
-                } else if (k == SDLK_m) {
-                    mirror_mode = !mirror_mode;
+                } else if (pending_quit && k == SDLK_s) {
+                    /* Save & quit — works in any mode */
+                    pending_quit = 0;
+                    const char *ext = strrchr(current_path, '.');
+                    int ok = 0;
+                    if (ext && (_stricmp(ext, ".jpg") == 0 || _stricmp(ext, ".jpeg") == 0))
+                        ok = stbi_write_jpg(current_path, ctx.w, ctx.h, 4, ctx.pixels, 92);
+                    else if (ext && _stricmp(ext, ".bmp") == 0)
+                        ok = stbi_write_bmp(current_path, ctx.w, ctx.h, 4, ctx.pixels);
+                    else
+                        ok = stbi_write_png(current_path, ctx.w, ctx.h, 4, ctx.pixels, ctx.w * 4);
                     snprintf(last_effect, sizeof(last_effect),
-                             mirror_mode ? "Mirror ON" : "Mirror OFF");
-                    input_confirmed = 1; input_len = 0; input[0] = '\0';
-                } else if (k == SDLK_c) {
-                    composite(dst.x, dst.y, draw_w, draw_h, win_w, win_h, mirror_mode);
-                    mirror_mode = 0;
-                    snprintf(last_effect, sizeof(last_effect), "Composite");
-                    input_confirmed = 1; input_len = 0; input[0] = '\0';
-                } else if (k == SDLK_t) {
-                    bg_r = rand() % 256;
-                    bg_g = rand() % 256;
-                    bg_b = rand() % 256;
-                    snprintf(last_effect, sizeof(last_effect),
-                             "BG #%02X%02X%02X", bg_r, bg_g, bg_b);
-                    input_confirmed = 1; input_len = 0; input[0] = '\0';
-                } else if (k == SDLK_s) {
-                    if (pending_quit) {
-                        /* Direkt speichern und beenden */
-                        pending_quit = 0;
-                        const char *ext = strrchr(current_path, '.');
-                        int ok = 0;
-                        if (ext && (_stricmp(ext, ".jpg") == 0 || _stricmp(ext, ".jpeg") == 0))
-                            ok = stbi_write_jpg(current_path, ctx.w, ctx.h, 4, ctx.pixels, 92);
-                        else if (ext && _stricmp(ext, ".bmp") == 0)
-                            ok = stbi_write_bmp(current_path, ctx.w, ctx.h, 4, ctx.pixels);
-                        else
-                            ok = stbi_write_png(current_path, ctx.w, ctx.h, 4, ctx.pixels, ctx.w * 4);
-                        snprintf(last_effect, sizeof(last_effect),
-                                 ok ? "Saved!" : "Save failed");
-                        input_confirmed = 1;
-                        running = 0;
-                    } else {
-                        /* Normale Speicher-Bestätigung */
-                        pending_save = 1;
-                        const char *fname = strrchr(current_path, '\\');
-                        if (!fname) fname = strrchr(current_path, '/');
-                        fname = fname ? fname + 1 : current_path;
-                        snprintf(last_effect, sizeof(last_effect),
-                                 "Overwrite \"%s\"? Y / N", fname);
-                        input_confirmed = 1; input_len = 0; input[0] = '\0';
-                    }
-                } else if (k == SDLK_e) {
-                    /* Export: nativer Speicherdialog via tinyfiledialogs */
-                    int was_quit = pending_quit;
+                             ok ? "Saved!" : "Save failed");
+                    input_confirmed = 1;
+                    running = 0;
+                } else if (pending_quit && k == SDLK_e) {
+                    /* Export & quit — works in any mode */
                     pending_quit = 0;
                     char export_path[MAX_PATH];
                     strncpy(export_path, current_path, sizeof(export_path) - 1);
@@ -567,36 +736,393 @@ int main(int argc, char *argv[]) {
                             ok = stbi_write_png(export_path, ctx.w, ctx.h, 4, ctx.pixels, ctx.w * 4);
                         snprintf(last_effect, sizeof(last_effect),
                                  ok ? "Exported!" : "Export failed");
-                        if (was_quit) running = 0;
+                        running = 0;
                     } else {
-                        snprintf(last_effect, sizeof(last_effect),
-                                 was_quit ? "Quit cancelled" : "Export cancelled");
+                        snprintf(last_effect, sizeof(last_effect), "Quit cancelled");
                     }
                     input_confirmed = 1; input_len = 0; input[0] = '\0';
-                } else if (k == SDLK_f) {
-                    fullscreen = !fullscreen;
-                    SDL_SetWindowFullscreen(ctx.win,
-                        fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-                    if (!fullscreen)
-                        SDL_SetWindowPosition(ctx.win,
-                            SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-                    snprintf(last_effect, sizeof(last_effect),
-                             fullscreen ? "Fullscreen ON" : "Fullscreen OFF");
-                    input_confirmed = 1; input_len = 0; input[0] = '\0';
+                } else if (help_mode && (k == SDLK_UP || k == SDLK_DOWN)) {
+                    /* Help scroll — global */
+                    if (k == SDLK_UP   && help_scroll > 0) help_scroll--;
+                    if (k == SDLK_DOWN && help_scroll < help_line_count - 1) help_scroll++;
                 }
+                /* ── Composition mode ──────────────────────────────────── */
+                else if (res_mode) {
+                    if (k == SDLK_UP || k == SDLK_DOWN ||
+                        k == SDLK_LEFT || k == SDLK_RIGHT) {
+                        int shifted = (e.key.keysym.mod & KMOD_SHIFT) != 0;
+                        int al=0,ar=0,at=0,ab=0;
+                        if (canvas_submode > 0) {
+                            if (!shifted) {
+                                if (k == SDLK_LEFT)  al =  10;
+                                if (k == SDLK_RIGHT) ar =  10;
+                                if (k == SDLK_UP)    at =  10;
+                                if (k == SDLK_DOWN)  ab =  10;
+                            } else {
+                                if (k == SDLK_LEFT || k == SDLK_RIGHT) { al = 10; ar = 10; }
+                                if (k == SDLK_UP   || k == SDLK_DOWN)  { at = 10; ab = 10; }
+                            }
+                        } else {
+                            if (!shifted) {
+                                if (k == SDLK_LEFT)  ar = -10;
+                                if (k == SDLK_RIGHT) al = -10;
+                                if (k == SDLK_UP)    ab = -10;
+                                if (k == SDLK_DOWN)  at = -10;
+                            } else {
+                                if (k == SDLK_LEFT || k == SDLK_RIGHT) { al = -10; ar = -10; }
+                                if (k == SDLK_UP   || k == SDLK_DOWN)  { at = -10; ab = -10; }
+                            }
+                        }
+                        if (canvas_submode > 0) {
+                            canvas_resize(al, ar, at, ab, canvas_fill_mode);
+                            comp_w = ctx.w; comp_h = ctx.h;
+                            snprintf(last_effect, sizeof(last_effect), "Comp %dx%d", ctx.w, ctx.h);
+                        } else {
+                            int dw = al + ar, dh = at + ab;
+                            comp_w += dw; if (comp_w < 1) comp_w = 1; if (comp_w > ctx.w) comp_w = ctx.w;
+                            comp_h += dh; if (comp_h < 1) comp_h = 1; if (comp_h > ctx.h) comp_h = ctx.h;
+                            comp_dirty = 1;
+                            snprintf(last_effect, sizeof(last_effect), "Comp frame %dx%d  (image %dx%d)", comp_w, comp_h, ctx.w, ctx.h);
+                        }
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_EQUALS || k == SDLK_PLUS || k == SDLK_KP_PLUS) {
+                        int nw = comp_w + 20;
+                        int nh = ctx.w > 0 ? (int)((float)nw * ctx.h / ctx.w + 0.5f) : nw;
+                        int dw = nw - ctx.w, dh = nh - ctx.h;
+                        if (dw > 0 || dh > 0) {
+                            int xdw = dw > 0 ? dw : 0, xdh = dh > 0 ? dh : 0;
+                            canvas_resize(xdw/2, xdw - xdw/2, xdh/2, xdh - xdh/2, canvas_fill_mode);
+                        }
+                        comp_w = nw < ctx.w ? nw : ctx.w;
+                        comp_h = nh < ctx.h ? nh : ctx.h;
+                        comp_dirty = 1;
+                        snprintf(last_effect, sizeof(last_effect), "Comp frame %dx%d", comp_w, comp_h);
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_MINUS || k == SDLK_KP_MINUS) {
+                        int nw = comp_w - 20; if (nw < 1) nw = 1;
+                        int nh = ctx.w > 0 ? (int)((float)nw * ctx.h / ctx.w + 0.5f) : nw;
+                        if (nh < 1) nh = 1;
+                        comp_w = nw; comp_h = nh;
+                        comp_dirty = 1;
+                        snprintf(last_effect, sizeof(last_effect), "Comp frame %dx%d  (image %dx%d)", comp_w, comp_h, ctx.w, ctx.h);
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_s) {
+                        canvas_submode = -1;
+                        snprintf(last_effect, sizeof(last_effect), "Comp: SHRINK  arrows=1 side  Shift+arrows=2 sides");
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_e) {
+                        canvas_submode = 1;
+                        snprintf(last_effect, sizeof(last_effect), "Comp: EXPAND  arrows=1 side  Shift+arrows=2 sides");
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                        if (input_len > 0) {
+                            char *xsep = strchr(input, 'x');
+                            char *sep  = strchr(input, ':');
+                            if (xsep && xsep != input && *(xsep + 1) != '\0') {
+                                int new_w = atoi(input);
+                                int new_h = atoi(xsep + 1);
+                                if (new_w >= 1 && new_h >= 1) {
+                                    int dw = new_w - ctx.w, dh = new_h - ctx.h;
+                                    if (dw > 0 || dh > 0) {
+                                        int xdw = dw > 0 ? dw : 0, xdh = dh > 0 ? dh : 0;
+                                        canvas_resize(xdw/2, xdw - xdw/2, xdh/2, xdh - xdh/2, canvas_fill_mode);
+                                    }
+                                    comp_w = new_w < ctx.w ? new_w : ctx.w;
+                                    comp_h = new_h < ctx.h ? new_h : ctx.h;
+                                    comp_dirty = 1;
+                                    snprintf(last_effect, sizeof(last_effect),
+                                             "Comp frame %dx%d  (image %dx%d)", comp_w, comp_h, ctx.w, ctx.h);
+                                } else {
+                                    snprintf(last_effect, sizeof(last_effect), "Invalid size");
+                                }
+                            } else if (sep && sep != input && *(sep + 1) != '\0') {
+                                int rw = atoi(input);
+                                int rh = atoi(sep + 1);
+                                if (rw >= 1 && rh >= 1) {
+                                    int new_w, new_h;
+                                    if ((long long)comp_w * rh >= (long long)comp_h * rw) {
+                                        new_w = comp_w; new_h = comp_w * rh / rw;
+                                    } else {
+                                        new_h = comp_h; new_w = comp_h * rw / rh;
+                                    }
+                                    int dw = new_w - ctx.w, dh = new_h - ctx.h;
+                                    if (dw > 0 || dh > 0) {
+                                        int xdw = dw > 0 ? dw : 0, xdh = dh > 0 ? dh : 0;
+                                        canvas_resize(xdw/2, xdw - xdw/2, xdh/2, xdh - xdh/2, canvas_fill_mode);
+                                    }
+                                    comp_w = new_w < ctx.w ? new_w : ctx.w;
+                                    comp_h = new_h < ctx.h ? new_h : ctx.h;
+                                    comp_dirty = 1;
+                                    snprintf(last_effect, sizeof(last_effect), "Comp %d:%d = %dx%d", rw, rh, comp_w, comp_h);
+                                }
+                            } else {
+                                int n = atoi(input);
+                                if (n >= 1 && n <= 1000) {
+                                    if (popup_has_template(n)) {
+                                        popup_open(n, win, win_w, win_h);
+                                        snprintf(last_effect, sizeof(last_effect),
+                                                 "%s...", popup_cur.name);
+                                    } else {
+                                        const char *name = on_number_confirmed(n);
+                                        if (name) snprintf(last_effect, sizeof(last_effect), "%s", name);
+                                        else      snprintf(last_effect, sizeof(last_effect), "???");
+                                    }
+                                }
+                            }
+                            input_confirmed = 1; input_len = 0; input[0] = '\0';
+                        }
+                    } else if (k == SDLK_c && !(e.key.keysym.mod & (KMOD_CTRL | KMOD_SHIFT))) {
+                        /* Exit composition mode — commit virtual shrink if pending */
+                        res_mode = 0;
+                        transform_mode = 0;
+                        if (comp_w < ctx.w || comp_h < ctx.h) {
+                            /* Virtual shrink → apply as real crop */
+                            int dl = ctx.w - comp_w, dt = ctx.h - comp_h;
+                            canvas_resize(-(dl/2), -(dl - dl/2), -(dt/2), -(dt - dt/2), 5 /* CENTER: keep content */);
+                        }
+                        comp_w = ctx.w; comp_h = ctx.h;
+                        ctx.needs_layout_update = 1;
+                        if (pre_comp_pixels)
+                            snprintf(last_effect, sizeof(last_effect), "Comp mode OFF  |  T = transform original into canvas");
+                        else
+                            snprintf(last_effect, sizeof(last_effect), "Comp mode OFF");
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    }
+                }
+                /* ── Transform mode ────────────────────────────────────── */
+                else if (transform_mode) {
+                    if (!(e.key.keysym.mod & (KMOD_CTRL | KMOD_SHIFT)) &&
+                        e.key.keysym.scancode >= SDL_SCANCODE_1 &&
+                        e.key.keysym.scancode <= SDL_SCANCODE_6) {
+                        static const char *fnames[] = {"","Fill","Fit","Stretch","Tile","Center","Span"};
+                        canvas_fill_mode = (int)(e.key.keysym.scancode - SDL_SCANCODE_1) + 1;
+                        if (pre_comp_pixels) {
+                            transform_fill(pre_comp_pixels, pre_comp_w, pre_comp_h, canvas_fill_mode);
+                            snprintf(last_effect, sizeof(last_effect),
+                                     "Transform %s  %dx%d", fnames[canvas_fill_mode], ctx.w, ctx.h);
+                        }
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_t && !(e.key.keysym.mod & KMOD_SHIFT)) {
+                        transform_mode = 0;
+                        snprintf(last_effect, sizeof(last_effect), "Transform OFF");
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                        if (input_len > 0) {
+                            int n = atoi(input);
+                            if (n >= 1 && n <= 1000) {
+                                if (popup_has_template(n)) {
+                                    popup_open(n, win, win_w, win_h);
+                                    snprintf(last_effect, sizeof(last_effect),
+                                             "%s...", popup_cur.name);
+                                } else {
+                                    const char *name = on_number_confirmed(n);
+                                    if (name) snprintf(last_effect, sizeof(last_effect), "%s", name);
+                                    else      snprintf(last_effect, sizeof(last_effect), "???");
+                                }
+                            }
+                            input_confirmed = 1;
+                        }
+                    }
+                }
+                /* ── Normal mode ────────────────────────────────────────── */
+                else {
+                    if (k == SDLK_UP || k == SDLK_DOWN ||
+                        k == SDLK_LEFT || k == SDLK_RIGHT) {
+                        if (mirror_mode || zoom_level > 1.0f) {
+                            int step = mirror_mode && zoom_level <= 1.0f
+                                       ? (draw_w > 4 ? draw_w / 4 : 1)
+                                       : (win_w - 2 * BORDER) / 8;
+                            if (k == SDLK_LEFT)  dst.x += step;
+                            if (k == SDLK_RIGHT) dst.x -= step;
+                            if (k == SDLK_UP)    dst.y += step;
+                            if (k == SDLK_DOWN)  dst.y -= step;
+                            if (!mirror_mode) {
+                                int iw = win_w - 2 * BORDER, ih = win_h - 2 * BORDER;
+                                if (draw_w > iw) {
+                                    if (dst.x > BORDER)                  dst.x = BORDER;
+                                    if (dst.x + draw_w < win_w - BORDER) dst.x = win_w - BORDER - draw_w;
+                                }
+                                if (draw_h > ih) {
+                                    if (dst.y > BORDER)                  dst.y = BORDER;
+                                    if (dst.y + draw_h < win_h - BORDER) dst.y = win_h - BORDER - draw_h;
+                                }
+                            }
+                        } else {
+                            int sw = ctx.crop_active ? ctx.crop_src_w : 1;
+                            int sh = ctx.crop_active ? ctx.crop_src_h : 1;
+                            int step = sw > sh ? sw / 20 : sh / 20;
+                            if (step < 5) step = 5;
+                            if (k == SDLK_UP)    crop_pan(0,    -step);
+                            if (k == SDLK_DOWN)  crop_pan(0,     step);
+                            if (k == SDLK_LEFT)  crop_pan(-step, 0);
+                            if (k == SDLK_RIGHT) crop_pan( step, 0);
+                        }
+                    } else if (k == SDLK_EQUALS || k == SDLK_PLUS || k == SDLK_KP_PLUS) {
+                        { int old_dw = draw_w, old_dh = draw_h;
+                        zoom_level += 0.25f;
+                        if (zoom_level > 4.0f) zoom_level = 4.0f;
+                        draw_w = (int)(base_draw_w * zoom_level);
+                        draw_h = (int)(base_draw_h * zoom_level);
+                        dst.x  = win_w/2 - (win_w/2 - dst.x) * draw_w / old_dw;
+                        dst.y  = win_h/2 - (win_h/2 - dst.y) * draw_h / old_dh;
+                        dst.w  = draw_w;
+                        dst.h  = draw_h;
+                        if (!mirror_mode) {
+                            int iw = win_w-2*BORDER, ih = win_h-2*BORDER;
+                            if (draw_w <= iw) { dst.x = BORDER; }
+                            else { if (dst.x > BORDER) dst.x = BORDER; if (dst.x+draw_w < win_w-BORDER) dst.x = win_w-BORDER-draw_w; }
+                            if (draw_h <= ih) { dst.y = BORDER; }
+                            else { if (dst.y > BORDER) dst.y = BORDER; if (dst.y+draw_h < win_h-BORDER) dst.y = win_h-BORDER-draw_h; }
+                        } }
+                        snprintf(last_effect, sizeof(last_effect), "Zoom %.2fx", zoom_level);
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_MINUS || k == SDLK_KP_MINUS) {
+                        { int old_dw = draw_w, old_dh = draw_h;
+                        zoom_level -= 0.25f;
+                        if (!mirror_mode && zoom_level < 1.0f) zoom_level = 1.0f;
+                        if (zoom_level < 0.25f) zoom_level = 0.25f;
+                        draw_w = (int)(base_draw_w * zoom_level);
+                        draw_h = (int)(base_draw_h * zoom_level);
+                        dst.x  = win_w/2 - (win_w/2 - dst.x) * draw_w / old_dw;
+                        dst.y  = win_h/2 - (win_h/2 - dst.y) * draw_h / old_dh;
+                        dst.w  = draw_w;
+                        dst.h  = draw_h;
+                        if (!mirror_mode) {
+                            int iw = win_w-2*BORDER, ih = win_h-2*BORDER;
+                            if (draw_w <= iw) { dst.x = BORDER; }
+                            else { if (dst.x > BORDER) dst.x = BORDER; if (dst.x+draw_w < win_w-BORDER) dst.x = win_w-BORDER-draw_w; }
+                            if (draw_h <= ih) { dst.y = BORDER; }
+                            else { if (dst.y > BORDER) dst.y = BORDER; if (dst.y+draw_h < win_h-BORDER) dst.y = win_h-BORDER-draw_h; }
+                        } }
+                        snprintf(last_effect, sizeof(last_effect), "Zoom %.2fx", zoom_level);
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_m) {
+                        mirror_mode = !mirror_mode;
+                        snprintf(last_effect, sizeof(last_effect),
+                                 mirror_mode ? "Mirror ON" : "Mirror OFF");
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_c && !(e.key.keysym.mod & (KMOD_CTRL | KMOD_SHIFT))) {
+                        /* Enter composition mode */
+                        res_mode = 1;
+                        canvas_submode = 1;
+                        comp_w = ctx.w; comp_h = ctx.h;
+                        if (pre_comp_pixels) free(pre_comp_pixels);
+                        pre_comp_pixels = malloc((size_t)ctx.w * ctx.h * 4);
+                        if (pre_comp_pixels)
+                            memcpy(pre_comp_pixels, ctx.pixels, (size_t)ctx.w * ctx.h * 4);
+                        pre_comp_w = ctx.w; pre_comp_h = ctx.h;
+                        snprintf(last_effect, sizeof(last_effect),
+                                 "Comp mode ON  E=expand  S=shrink  +/-=all sides  (T after exit)");
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_c &&
+                               (e.key.keysym.mod & KMOD_CTRL) &&
+                               (e.key.keysym.mod & KMOD_SHIFT)) {
+                        composite(dst.x, dst.y, draw_w, draw_h, win_w, win_h, mirror_mode);
+                        mirror_mode = 0;
+                        snprintf(last_effect, sizeof(last_effect), "Composite");
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_s) {
+                        pending_save = 1;
+                        const char *fname = strrchr(current_path, '\\');
+                        if (!fname) fname = strrchr(current_path, '/');
+                        fname = fname ? fname + 1 : current_path;
+                        snprintf(last_effect, sizeof(last_effect),
+                                 "Overwrite \"%s\"? Y / N", fname);
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_e) {
+                        char export_path[MAX_PATH];
+                        strncpy(export_path, current_path, sizeof(export_path) - 1);
+                        if (save_file_dialog(export_path, sizeof(export_path))) {
+                            const char *ext = strrchr(export_path, '.');
+                            int ok = 0;
+                            if (ext && (_stricmp(ext, ".jpg") == 0 || _stricmp(ext, ".jpeg") == 0))
+                                ok = stbi_write_jpg(export_path, ctx.w, ctx.h, 4, ctx.pixels, 92);
+                            else if (ext && _stricmp(ext, ".bmp") == 0)
+                                ok = stbi_write_bmp(export_path, ctx.w, ctx.h, 4, ctx.pixels);
+                            else
+                                ok = stbi_write_png(export_path, ctx.w, ctx.h, 4, ctx.pixels, ctx.w * 4);
+                            snprintf(last_effect, sizeof(last_effect),
+                                     ok ? "Exported!" : "Export failed");
+                        } else {
+                            snprintf(last_effect, sizeof(last_effect), "Export cancelled");
+                        }
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_t && !(e.key.keysym.mod & KMOD_SHIFT)) {
+                        /* T: toggle transform mode (uses pre-comp original) */
+                        if (pre_comp_pixels) {
+                            transform_mode = !transform_mode;
+                            snprintf(last_effect, sizeof(last_effect),
+                                     transform_mode
+                                     ? "Transform ON  1-6 = fit original into canvas"
+                                     : "Transform OFF");
+                        } else {
+                            snprintf(last_effect, sizeof(last_effect),
+                                     "Transform: enter Comp mode (C) first to save a reference");
+                        }
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (transform_mode && pre_comp_pixels &&
+                               !(e.key.keysym.mod & (KMOD_CTRL | KMOD_SHIFT)) &&
+                               e.key.keysym.scancode >= SDL_SCANCODE_1 &&
+                               e.key.keysym.scancode <= SDL_SCANCODE_6) {
+                        /* 1-6 in transform mode: fit original into current canvas */
+                        static const char *fnames[] = {"","Fill","Fit","Stretch","Tile","Center","Span"};
+                        canvas_fill_mode = (int)(e.key.keysym.scancode - SDL_SCANCODE_1) + 1;
+                        transform_fill(pre_comp_pixels, pre_comp_w, pre_comp_h, canvas_fill_mode);
+                        snprintf(last_effect, sizeof(last_effect),
+                                 "Transform %s  %dx%d", fnames[canvas_fill_mode], ctx.w, ctx.h);
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_t && (e.key.keysym.mod & KMOD_SHIFT)) {
+                        bg_r = rand() % 256;
+                        bg_g = rand() % 256;
+                        bg_b = rand() % 256;
+                        snprintf(last_effect, sizeof(last_effect),
+                                 "BG #%02X%02X%02X", bg_r, bg_g, bg_b);
+                        input_confirmed = 1; input_len = 0; input[0] = '\0';
+                    } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                        if (input_len > 0) {
+                            char *sep = strchr(input, ':');
+                            if (sep && sep != input && *(sep + 1) != '\0') {
+                                int rw = atoi(input);
+                                int rh = atoi(sep + 1);
+                                if (rw >= 1 && rh >= 1) {
+                                    const char *name = crop_aspect(rw, rh);
+                                    if (name) snprintf(last_effect, sizeof(last_effect), "%s %d:%d", name, rw, rh);
+                                    else      snprintf(last_effect, sizeof(last_effect), "???");
+                                }
+                            } else {
+                                int n = atoi(input);
+                                if (n >= 1 && n <= 1000) {
+                                    if (popup_has_template(n)) {
+                                        popup_open(n, win, win_w, win_h);
+                                        snprintf(last_effect, sizeof(last_effect),
+                                                 "%s...", popup_cur.name);
+                                    } else {
+                                        const char *name = on_number_confirmed(n);
+                                        if (name) snprintf(last_effect, sizeof(last_effect), "%s", name);
+                                        else      snprintf(last_effect, sizeof(last_effect), "???");
+                                    }
+                                }
+                            }
+                            input_confirmed = 1;
+                        }
+                    }
+                }
+                } /* end else (popup_active) */
             }
 
             if (e.type == SDL_TEXTINPUT) {
                 char c = e.text.text[0];
                 int is_digit = (c >= '0' && c <= '9');
                 int is_colon = (c == ':' && input_len > 0 && !strchr(input, ':'));
-                if (is_digit || is_colon) {
+                int is_x     = (c == 'x' && res_mode && input_len > 0
+                                && !strchr(input,'x') && !strchr(input,':'));
+                if (is_digit || is_colon || is_x) {
                     if (input_confirmed) {
                         input_len       = 0;
                         input[0]        = '\0';
                         input_confirmed = 0;
                     }
-                    if (input_len < 6) {
+                    if (input_len < 14) {
                         input[input_len++] = c;
                         input[input_len]   = '\0';
                     }
@@ -626,18 +1152,56 @@ int main(int argc, char *argv[]) {
             SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         }
 
+        if (comp_dirty) {
+            comp_dirty = 0;
+            int eff_w = comp_w, eff_h = comp_h;
+            zoom_level = 1.0f;
+            int max_i = MAX_SIZE - 2 * BORDER;
+            float sx = (float)max_i / eff_w;
+            float sy = (float)max_i / eff_h;
+            float sc = sx < sy ? sx : sy;
+            base_draw_w = (int)(eff_w * sc);
+            base_draw_h = (int)(eff_h * sc);
+            draw_w = base_draw_w;
+            draw_h = base_draw_h;
+            win_w  = draw_w + 2 * BORDER;
+            win_h  = draw_h + 2 * BORDER;
+            dst.x  = BORDER;
+            dst.y  = BORDER;
+            dst.w  = draw_w;
+            dst.h  = draw_h;
+            bot_y  = BORDER + draw_h + (BORDER - 13) / 2.0f;
+            SDL_SetWindowSize(ctx.win, win_w, win_h);
+            SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+        }
+
         SDL_SetRenderDrawColor(ctx.ren, bg_r, bg_g, bg_b, 255);
         SDL_RenderClear(ctx.ren);
         if (fullscreen) {
             int aw, ah;
             SDL_GetWindowSize(ctx.win, &aw, &ah);
-            SDL_Rect vp = { (aw - win_w) / 2, (ah - win_h) / 2, win_w, win_h };
+            /* In fullscreen, expand viewport to include popup panel if active */
+            int vp_w = popup_active ? win_w + POPUP_W : win_w;
+            SDL_Rect vp = { (aw - vp_w) / 2, (ah - win_h) / 2, vp_w, win_h };
             SDL_RenderSetViewport(ctx.ren, &vp);
         } else {
             SDL_RenderSetViewport(ctx.ren, NULL);
         }
         SDL_Rect safe = { BORDER, BORDER, win_w - 2 * BORDER, win_h - 2 * BORDER };
         SDL_RenderSetClipRect(ctx.ren, &safe);
+        /* Use downscaled preview tex during popup (stretched to full dst rect by SDL) */
+        SDL_Texture *display_tex = (popup_active && popup_preview_tex)
+                                   ? popup_preview_tex : ctx.tex;
+        /* Comp frame: show only comp_w x comp_h region (centered in image) */
+        SDL_Rect *p_src = NULL;
+        SDL_Rect src_rect;
+        if (!popup_active && (comp_w < ctx.w || comp_h < ctx.h)) {
+            src_rect.x = (ctx.w - comp_w) / 2;
+            src_rect.y = (ctx.h - comp_h) / 2;
+            src_rect.w = comp_w;
+            src_rect.h = comp_h;
+            p_src = &src_rect;
+        }
         if (mirror_mode && draw_w > 0 && draw_h > 0) {
             int i_min = (BORDER - dst.x) / draw_w - 1;
             int i_max = (win_w - BORDER - dst.x) / draw_w + 1;
@@ -655,23 +1219,39 @@ int main(int argc, char *argv[]) {
                     int flip = 0;
                     if (fh) flip |= SDL_FLIP_HORIZONTAL;
                     if (fv) flip |= SDL_FLIP_VERTICAL;
-                    SDL_RenderCopyEx(ctx.ren, ctx.tex, NULL, &tile,
+                    SDL_RenderCopyEx(ctx.ren, display_tex, p_src, &tile,
                                      0.0, NULL, (SDL_RendererFlip)flip);
                 }
             }
         } else {
-            SDL_RenderCopy(ctx.ren, ctx.tex, NULL, &dst);
+            SDL_RenderCopy(ctx.ren, display_tex, p_src, &dst);
         }
         SDL_RenderSetClipRect(ctx.ren, NULL);
         if (mirror_mode) {
             draw_text(ctx.ren, BORDER + 3, BORDER + 3, "MIRROR MODE ACTIVE", 255, 80, 80);
+        }
+        if (transform_mode) {
+            static const char *fnames[] = {"","FILL","FIT","STRETCH","TILE","CENTER","SPAN"};
+            char tlabel[48];
+            snprintf(tlabel, sizeof(tlabel), "TRANSFORM [%s]  orig %dx%d",
+                     fnames[canvas_fill_mode], pre_comp_w, pre_comp_h);
+            int tw = text_width(tlabel);
+            draw_text(ctx.ren, win_w - BORDER - tw, BORDER + 16, tlabel, 255, 200, 80);
+        }
+        if (res_mode) {
+            char reslabel[64];
+            if (comp_w != ctx.w || comp_h != ctx.h)
+                snprintf(reslabel, sizeof(reslabel), "COMP %dx%d  img %dx%d", comp_w, comp_h, ctx.w, ctx.h);
+            else
+                snprintf(reslabel, sizeof(reslabel), "COMP %dx%d", comp_w, comp_h);
+            draw_text(ctx.ren, BORDER + 3, BORDER + 3, reslabel, 100, 200, 255);
         }
 
         draw_text(ctx.ren, BORDER, (BORDER - 13) / 2.0f, argv[1], 255, 255, 255);
 
 
         /* Große zentrierte Zahl über dem Bild während der Eingabe */
-        if (input_len > 0) {
+        if (input_len > 0 && !popup_active && !res_mode) {
             float big_scale = 15.0f;
             float text_w = text_width(input) * big_scale;
             float text_h = 13.0f * big_scale;
@@ -752,9 +1332,14 @@ int main(int argc, char *argv[]) {
             draw_text(ctx.ren, x_margin, win_h - BORDER / 2 - 6, hint, 80, 80, 80);
         }
 
+        popup_render(ctx.ren, win_h);
         SDL_RenderPresent(ctx.ren);
     }
 
+    /* cleanup popup if still open */
+    if (popup_saved_px) { free(popup_saved_px); popup_saved_px = NULL; }
+    popup_free_preview();
+    ctx.preview_mode = 0;
     stbi_image_free(ctx.pixels);
     if (ctx.crop_src) free(ctx.crop_src);
     free(ctx.original_pixels);

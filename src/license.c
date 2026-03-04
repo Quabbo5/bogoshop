@@ -21,7 +21,7 @@
    TODO: Nach dem Railway-Deploy diese URL durch die echte ersetzen.
    Beispiel: L"bogoshop-api.up.railway.app"
    ──────────────────────────────────────────────────────────────────────── */
-#define RAILWAY_HOST    L"YOUR-APP.up.railway.app"
+#define RAILWAY_HOST    L"bogoshop-production.up.railway.app"
 #define RAILWAY_PATH    L"/verify"
 
 /* Offline-Gnadenfrist: 7 Tage in Sekunden */
@@ -66,6 +66,7 @@ static void get_machine_id(char out[16]) {
 static int online_verify_key(const char *key) {
     char machine_id[16];
     get_machine_id(machine_id);
+    printf("[license] machine-id: %s\n", machine_id);
 
     /* JSON-Body bauen */
     char body[128];
@@ -75,26 +76,28 @@ static int online_verify_key(const char *key) {
 
     int result = -1; /* Standard: Offline */
 
+    printf("[license] connecting to bogoshop-production.up.railway.app ...\n");
     HINTERNET hSession = WinHttpOpen(
         L"bogoshop/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return -1;
+    if (!hSession) { printf("[license] WinHttpOpen failed\n"); return -1; }
 
     HINTERNET hConn = WinHttpConnect(hSession, RAILWAY_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!hConn) { WinHttpCloseHandle(hSession); return -1; }
+    if (!hConn) { printf("[license] connect failed\n"); WinHttpCloseHandle(hSession); return -1; }
 
     HINTERNET hReq = WinHttpOpenRequest(
         hConn, L"POST", RAILWAY_PATH,
         NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
         WINHTTP_FLAG_SECURE);
-    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession); return -1; }
+    if (!hReq) { printf("[license] open request failed\n"); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession); return -1; }
 
     /* Timeout: 5 Sekunden */
     DWORD timeout = 5000;
     WinHttpSetOption(hReq, WINHTTP_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
     WinHttpSetOption(hReq, WINHTTP_OPTION_RECEIVE_TIMEOUT,  &timeout, sizeof(timeout));
 
+    printf("[license] sending request ...\n");
     BOOL sent = WinHttpSendRequest(
         hReq,
         L"Content-Type: application/json\r\n",
@@ -105,13 +108,16 @@ static int online_verify_key(const char *key) {
         char resp[256] = {0};
         DWORD read = 0;
         WinHttpReadData(hReq, resp, sizeof(resp) - 1, &read);
-        /* Simples Check: enthält die Antwort "true"? */
+        printf("[license] server response: %s\n", resp);
         result = (strstr(resp, "\"valid\":true") != NULL) ? 1 : 0;
+    } else {
+        printf("[license] no response (offline?)\n");
     }
 
     WinHttpCloseHandle(hReq);
     WinHttpCloseHandle(hConn);
     WinHttpCloseHandle(hSession);
+    printf("[license] result: %s\n", result == 1 ? "valid" : result == 0 ? "invalid" : "offline");
     return result;
 }
 #else
@@ -185,27 +191,31 @@ int load_license(void) {
     if (!home) return 0;
     snprintf(path, sizeof(path), "%s/.config/bogoshop/license.key", home);
 #endif
+    printf("[license] looking for license at: %s\n", path);
     FILE *f = fopen(path, "r");
-    if (!f) return 0;
+    if (!f) { printf("[license] no license file found\n"); return 0; }
     char key[32] = {0};
     fgets(key, sizeof(key), f);
     fclose(f);
-    /* Trailing newline entfernen */
     key[strcspn(key, "\r\n")] = '\0';
+    printf("[license] found key: %s\n", key);
 
     /* Lokale Struktur muss stimmen (Prüfsumme) */
-    if (!validate_key(key)) return 0;
+    if (!validate_key(key)) { printf("[license] local checksum invalid\n"); return 0; }
+    printf("[license] local checksum OK\n");
 
     /* Online-Check: Server ist die eigentliche Autorität */
     int online = online_verify_key(key);
     if (online == 1) {
-        save_last_online(); /* Timestamp für Offline-Gnadenfrist aktualisieren */
+        save_last_online();
         return 1;
     }
-    if (online == 0) return 0; /* Server sagt: ungültig/widerrufen */
+    if (online == 0) { printf("[license] server rejected key\n"); return 0; }
 
     /* online == -1: kein Netz — Gnadenfrist prüfen */
-    return offline_grace_ok();
+    int grace = offline_grace_ok();
+    printf("[license] offline grace period: %s\n", grace ? "OK" : "expired");
+    return grace;
 }
 
 void save_license(const char *key) {
@@ -272,17 +282,21 @@ int show_license_screen(SDL_Window *win, SDL_Renderer *ren) {
                     }
                 }
                 if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                    printf("[license] user submitted key: %s\n", input);
                     if (validate_key(input)) {
+                        printf("[license] local checksum OK — checking server ...\n");
                         int online = online_verify_key(input);
                         if (online == 1 || online == -1) {
-                            /* 1 = Server OK, -1 = offline (strukturell OK reicht für Erstaktivierung) */
                             if (online == 1) save_last_online();
                             save_license(input);
+                            printf("[license] activation successful\n");
                             state = 1; running = 0; result = 1;
                         } else {
-                            state = 2; /* Server: ungültig oder max Geräte erreicht */
+                            printf("[license] server rejected key\n");
+                            state = 2;
                         }
                     } else {
+                        printf("[license] local checksum failed — invalid key\n");
                         state = 2;
                     }
                 }

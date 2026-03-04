@@ -2,10 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 ImageCtx ctx;
 
-static void save_undo_state(void) {
+void save_undo_state(void) {
     if (ctx.preview_mode) return;
     int total_bytes = ctx.w * ctx.h * 4;
     memcpy(ctx.undo_stack[ctx.undo_head], ctx.pixels, total_bytes);
@@ -217,21 +218,226 @@ void gold(int amount) {
     fflush(stdout);
 }
 
-/* ── Effect-Tabelle: ID → Funktion → Amount → Name ───────────────────── */
-static const struct {
-    int         id;
-    void      (*fn)(int);
-    int         amount;
-    const char *name;
-} effects[] = {
-    { 1, brighten,        30, "Brighten"  },
-    { 2, darken,          30, "Darken"    },
-    { 3, iceing,          30, "Iceing"    },
-    { 4, my_new_function, 30, "MyFunc"    },
-    { 5, negative,         0, "Negative"  },
-    { 6, kachel_function,  0, "Kachel"    },
-    { 7, gold,            40, "Gold"      },
+/* ── Rainbow core: screen-blend gradient at any angle ───────────────── */
+/* intensity: 0-100   direction: 0-359 deg (0=top→bottom, 90=left→right) */
+static void rainbow_ex(int intensity, int direction) {
+    
+    int   w      = ctx.w, h = ctx.h;
+    float intens = intensity / 100.0f;
+    float angle  = (float)direction * 3.14159265f / 180.0f;
+
+    /* Gradient axis direction vector (screen coords, y-down) */
+    float dx = sinf(angle);
+    float dy = cosf(angle);
+
+    /* Maximum projection of any corner onto the axis → used to normalise t */
+    float t_max = 0.5f * fabsf(dx) + 0.5f * fabsf(dy);
+    if (t_max < 1e-6f) t_max = 1e-6f;
+
+    for (int y = 0; y < h; y++) {
+        float ny = (h > 1) ? ((float)y / (h - 1) - 0.5f) : 0.0f;
+        for (int x = 0; x < w; x++) {
+            float nx = (w > 1) ? ((float)x / (w - 1) - 0.5f) : 0.0f;
+
+            /* Project pixel position onto gradient axis → t in [0,1] */
+            float t = (nx * dx + ny * dy + t_max) / (2.0f * t_max);
+            if (t < 0.0f) t = 0.0f;
+            if (t > 1.0f) t = 1.0f;
+
+            /* Hue: 0° (red) → 270° (violet) */
+            float hue = t * 270.0f;
+            float H   = hue / 60.0f;
+            int   sec = (int)H;
+            float f   = H - sec;
+            float q   = 1.0f - f;
+            float rr, gg, bb;
+            switch (sec) {
+                case 0: rr=1; gg=f; bb=0; break;
+                case 1: rr=q; gg=1; bb=0; break;
+                case 2: rr=0; gg=1; bb=f; break;
+                case 3: rr=0; gg=q; bb=1; break;
+                case 4: rr=f; gg=0; bb=1; break;
+                default:rr=1; gg=0; bb=q; break;
+            }
+            rr *= intens; gg *= intens; bb *= intens;
+
+            unsigned char *p = ctx.pixels + (y * w + x) * 4;
+            float sr = p[0] / 255.0f, sg = p[1] / 255.0f, sb = p[2] / 255.0f;
+            /* Screen blend: 1 - (1-src)*(1-overlay) */
+            p[0] = (unsigned char)((1.0f-(1.0f-sr)*(1.0f-rr))*255.0f+0.5f);
+            p[1] = (unsigned char)((1.0f-(1.0f-sg)*(1.0f-gg))*255.0f+0.5f);
+            p[2] = (unsigned char)((1.0f-(1.0f-sb)*(1.0f-bb))*255.0f+0.5f);
+        }
+    }
+    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
+}
+
+/* ── Rainbow public wrapper (saves undo, default direction = top→bottom) */
+void rainbow(int amount) {
+    save_undo_state();
+    rainbow_ex(amount, 0);
+    printf("Applied: Rainbow Overlay -- ID: 008\n"); fflush(stdout);
+}
+
+/* ── Pixel Sort ──────────────────────────────────────────────────────── */
+/* Returns sort key in 0..255 range for the given mode:                  */
+/*   1 = Luminance,  2 = Hue,  3 = Saturation                           */
+static float ps_key(unsigned char r, unsigned char g, unsigned char b, int mode) {
+    switch (mode) {
+        case 2: {
+            float fr = r/255.f, fg = g/255.f, fb = b/255.f;
+            float M = fr>fg?(fr>fb?fr:fb):(fg>fb?fg:fb);
+            float m = fr<fg?(fr<fb?fr:fb):(fg<fb?fg:fb);
+            float d = M - m;
+            if (d < 1e-6f) return 0.f;
+            float h;
+            if      (M==fr) h = 60.f * fmodf((fg-fb)/d, 6.f);
+            else if (M==fg) h = 60.f * ((fb-fr)/d + 2.f);
+            else            h = 60.f * ((fr-fg)/d + 4.f);
+            if (h < 0.f) h += 360.f;
+            return h / 360.f * 255.f;
+        }
+        case 3: {
+            float fr = r/255.f, fg = g/255.f, fb = b/255.f;
+            float M = fr>fg?(fr>fb?fr:fb):(fg>fb?fg:fb);
+            float m = fr<fg?(fr<fb?fr:fb):(fg<fb?fg:fb);
+            if (M < 1e-6f) return 0.f;
+            return ((M-m)/M) * 255.f;
+        }
+        default: /* Luminance */
+            return 0.2126f*r + 0.7152f*g + 0.0722f*b;
+    }
+}
+
+static int            ps_sort_mode;
+static unsigned char *ps_sort_line;
+
+static int ps_cmp(const void *a, const void *b) {
+    float ka = ps_key(ps_sort_line[(*(const int*)a)*4  ],
+                      ps_sort_line[(*(const int*)a)*4+1],
+                      ps_sort_line[(*(const int*)a)*4+2], ps_sort_mode);
+    float kb = ps_key(ps_sort_line[(*(const int*)b)*4  ],
+                      ps_sort_line[(*(const int*)b)*4+1],
+                      ps_sort_line[(*(const int*)b)*4+2], ps_sort_mode);
+    return (ka > kb) - (ka < kb);
+}
+
+static void pixel_sort_ex(int mode, int lo, int hi, int vertical) {
+    int w = ctx.w, h = ctx.h;
+    int outer = vertical ? w : h;
+    int inner = vertical ? h : w;
+
+    unsigned char *src  = malloc(w * h * 4);
+    int           *idx  = malloc(inner * sizeof(int));
+    unsigned char *line = malloc(inner * 4);
+    unsigned char *seg  = malloc(inner * 4);
+    if (!src || !idx || !line || !seg) {
+        free(src); free(idx); free(line); free(seg); return;
+    }
+    memcpy(src, ctx.pixels, w * h * 4);
+
+    for (int o = 0; o < outer; o++) {
+        /* extract line */
+        for (int i = 0; i < inner; i++) {
+            int px = vertical ? o : i, py = vertical ? i : o;
+            memcpy(line + i*4, src + (py*w + px)*4, 4);
+        }
+
+        /* find threshold intervals and sort each */
+        ps_sort_mode = mode;
+        ps_sort_line = line;
+        int i = 0;
+        while (i < inner) {
+            float k = ps_key(line[i*4], line[i*4+1], line[i*4+2], mode);
+            if (k < lo || k > hi) { i++; continue; }
+            int start = i, cnt = 0;
+            while (i < inner) {
+                k = ps_key(line[i*4], line[i*4+1], line[i*4+2], mode);
+                if (k < lo || k > hi) break;
+                idx[cnt++] = i++;
+            }
+            if (cnt > 1) {
+                qsort(idx, cnt, sizeof(int), ps_cmp);
+                for (int j = 0; j < cnt; j++)
+                    memcpy(seg + j*4, line + idx[j]*4, 4);
+                for (int j = 0; j < cnt; j++)
+                    memcpy(line + (start+j)*4, seg + j*4, 4);
+            }
+        }
+
+        /* write back */
+        for (int i2 = 0; i2 < inner; i2++) {
+            int px = vertical ? o : i2, py = vertical ? i2 : o;
+            memcpy(ctx.pixels + (py*w + px)*4, line + i2*4, 4);
+        }
+    }
+    free(src); free(idx); free(line); free(seg);
+    SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
+}
+
+void pixel_sort(int amount) {
+    save_undo_state();
+    pixel_sort_ex(1, 60, 200, 0);
+    printf("Applied: Pixel Sort -- ID: 009\n"); fflush(stdout);
+}
+
+/* ── Effect-Tabelle ──────────────────────────────────────────────────── */
+/* param_count > 0  → popup with sliders; 0 → direct apply              */
+static const Effect effects[] = {
+    { 1, brighten,        30, "Brighten",  0, {{0}} },
+    { 2, darken,          30, "Darken",    0, {{0}} },
+    { 3, iceing,          30, "Iceing",    0, {{0}} },
+    { 4, my_new_function, 30, "MyFunc",    0, {{0}} },
+    { 5, negative,         0, "Negative",  0, {{0}} },
+    { 6, kachel_function,  0, "Kachel",    0, {{0}} },
+    { 7, gold,            40, "Gold",      0, {{0}} },
+    { 8, rainbow,         60, "Rainbow Overlay v1",   2, {
+        { "Intensity",  60,   0, 100,  5 },
+        { "Direction",   0,   0, 359, 15 },
+    }},
+    { 9, pixel_sort,       0, "Pixel Sort",            4, {
+        { "Mode  1=Lum 2=Hue 3=Sat",  1,  1,   3,  1 },
+        { "Low threshold",            60,  0, 255,  5 },
+        { "High threshold",          200,  0, 255,  5 },
+        { "Direction  0=H 1=V",        0,  0,   1,  1 },
+    }},
 };
+#define EFFECTS_N (int)(sizeof(effects)/sizeof(effects[0]))
+
+/* Return pointer to effect entry (NULL if not found) */
+const Effect *get_effect(int id) {
+    for (int i = 0; i < EFFECTS_N; i++)
+        if (effects[i].id == id) return &effects[i];
+    return NULL;
+}
+
+/* Apply effect with explicit params array (used by popup preview + confirm) */
+const char *apply_effect_params(int id, int *params, int n_params) {
+    for (int i = 0; i < EFFECTS_N; i++) {
+        if (effects[i].id != id) continue;
+        if (id == 8) {
+            /* Rainbow: intensity + direction */
+            int intensity = (n_params > 0) ? params[0] : effects[i].params[0].value;
+            int direction = (n_params > 1) ? params[1] : effects[i].params[1].value;
+            save_undo_state();
+            rainbow_ex(intensity, direction);
+        } else if (id == 9) {
+            /* Pixel Sort: mode, lo, hi, direction */
+            int mode = (n_params > 0) ? params[0] : effects[i].params[0].value;
+            int lo   = (n_params > 1) ? params[1] : effects[i].params[1].value;
+            int hi   = (n_params > 2) ? params[2] : effects[i].params[2].value;
+            int vert = (n_params > 3) ? params[3] : effects[i].params[3].value;
+            save_undo_state();
+            pixel_sort_ex(mode, lo, hi, vert);
+        } else {
+            /* All other effects: single amount */
+            int amount = (n_params > 0) ? params[0] : effects[i].default_amount;
+            effects[i].fn(amount);
+        }
+        return effects[i].name;
+    }
+    return NULL;
+}
 
 /* catching signals – gibt den Effektnamen zurück, NULL wenn nicht gefunden */
 const char *on_number_confirmed(int n) {
@@ -239,7 +445,7 @@ const char *on_number_confirmed(int n) {
     fflush(stdout);
     for (int i = 0; i < (int)(sizeof(effects) / sizeof(effects[0])); i++) {
         if (effects[i].id == n) {
-            effects[i].fn(effects[i].amount);
+            effects[i].fn(effects[i].default_amount);
             return effects[i].name;
         }
     }
