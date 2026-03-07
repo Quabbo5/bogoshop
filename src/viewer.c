@@ -2,8 +2,7 @@
 #include "vendor/stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "vendor/stb_image_write.h"
-#define STB_EASY_FONT_IMPLEMENTATION
-#include "vendor/stb_easy_font.h"
+#include <SDL2/SDL_ttf.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -19,13 +18,14 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "effects.h"
 #include "license.h"
 #include "render.h"
 #include "vendor/tinyfiledialogs.h"
 
-#define BOGOSHOP_VERSION "0.2.0_PRE_RELEASE"
+#define BOGOSHOP_VERSION "0.2.1_PRE_RELEASE"
 
 #define HELP_MAX_LINES 512
 #define HELP_LINE_LEN  256
@@ -104,43 +104,50 @@ static int save_file_dialog(char *out, int out_size) {
 #endif
 }
 
-/* Render text normal */
-void draw_text(SDL_Renderer *ren, float x, float y, const char *text,
-               Uint8 r, Uint8 g, Uint8 b) {
-    char tbuf[65536];
-    int quads = stb_easy_font_print(x, y, (char *)text, NULL, tbuf, sizeof(tbuf));
-    SDL_SetRenderDrawColor(ren, r, g, b, 255);
-    for (int i = 0; i < quads; i++) {
-        float *v = (float *)(tbuf + i * 64);
-        SDL_Rect rect = {
-            (int)v[0],  (int)v[1],
-            (int)(v[4] - v[0]),
-            (int)(v[9] - v[5])
-        };
-        SDL_RenderFillRect(ren, &rect);
-    }
+/* ── TTF font globals ────────────────────────────────────────────────────── */
+static TTF_Font *font_sm     = NULL;  /* 12pt — windowed UI           */
+static TTF_Font *font_lg     = NULL;  /* 17pt — fullscreen UI         */
+static TTF_Font *font_xl     = NULL;  /* 64pt — big centre number     */
+TTF_Font        *font_active = NULL;  /* points to font_sm or font_lg */
+
+/* Internal helper: render one string with a specific font */
+static void ttf_draw(SDL_Renderer *ren, float x, float y, const char *text,
+                     TTF_Font *font, Uint8 r, Uint8 g, Uint8 b) {
+    if (!font || !text || !text[0]) return;
+    SDL_Color col = {r, g, b, 255};
+    SDL_Surface *surf = TTF_RenderText_Blended(font, text, col);
+    if (!surf) return;
+    SDL_Texture *tex = SDL_CreateTextureFromSurface(ren, surf);
+    SDL_FreeSurface(surf);
+    if (!tex) return;
+    int w, h;
+    SDL_QueryTexture(tex, NULL, NULL, &w, &h);
+    SDL_Rect dst = {(int)x, (int)y, w, h};
+    SDL_RenderCopy(ren, tex, NULL, &dst);
+    SDL_DestroyTexture(tex);
 }
 
-/* Render text skaliert – rendert erst bei Ursprung, dann skaliert + versetzt */
+/* Render text with font_active */
+void draw_text(SDL_Renderer *ren, float x, float y, const char *text,
+               Uint8 r, Uint8 g, Uint8 b) {
+    ttf_draw(ren, x, y, text, font_active, r, g, b);
+}
+
+/* scale > 8  → font_xl (big centre number)
+   scale > 1.5 → font_lg (license screen titles, etc.)
+   else        → font_active */
 void draw_text_scaled(SDL_Renderer *ren, float x, float y, const char *text,
                       float scale, Uint8 r, Uint8 g, Uint8 b) {
-    char tbuf[65536];
-    int quads = stb_easy_font_print(0, 0, (char *)text, NULL, tbuf, sizeof(tbuf));
-    SDL_SetRenderDrawColor(ren, r, g, b, 255);
-    for (int i = 0; i < quads; i++) {
-        float *v = (float *)(tbuf + i * 64);
-        SDL_Rect rect = {
-            (int)(x + v[0] * scale),
-            (int)(y + v[1] * scale),
-            (int)((v[4] - v[0]) * scale),
-            (int)((v[9] - v[5]) * scale)
-        };
-        SDL_RenderFillRect(ren, &rect);
-    }
+    TTF_Font *f = (scale > 8.0f)  ? font_xl     :
+                  (scale > 1.5f)  ? font_lg      : font_active;
+    ttf_draw(ren, x, y, text, f, r, g, b);
 }
 
 int text_width(const char *text) {
-    return stb_easy_font_width((char *)text);
+    if (!font_active || !text || !text[0]) return 0;
+    int w = 0;
+    TTF_SizeText(font_active, text, &w, NULL);
+    return w;
 }
 
 #ifdef _WIN32
@@ -177,8 +184,8 @@ static void force_foreground(SDL_Window *win) { SDL_RaiseWindow(win); }
 /* ══════════════════════════════════════════════════════════════════════════
    Effect Popup — embedded panel, main window expands to the right
    ══════════════════════════════════════════════════════════════════════════ */
-#define POPUP_W           280  /* panel width added to the right of the main window */
-#define POPUP_PREVIEW_MAX 512  /* max dimension of fast-preview downsample */
+#define POPUP_W           340  /* panel width added to the right of the main window */
+#define POPUP_PREVIEW_MAX 3000 /* max dimension of fast-preview downsample */
 
 /* ── State ───────────────────────────────────────────────────────────── */
 /* popup_cur: mutable copy of a const Effect entry (param values adjusted by user) */
@@ -192,6 +199,31 @@ static unsigned char *popup_preview_og = NULL; /* backup of downscaled orig */
 static SDL_Texture   *popup_preview_tex = NULL;
 static int            popup_preview_w  = 0;
 static int            popup_preview_h  = 0;
+
+/* ── Effect-Suchpopup ────────────────────────────────────────────────── */
+#define SEARCH_MAX_RESULTS 16
+
+static int search_match(const char *haystack, const char *needle) {
+    char h[128], n[64];
+    int i;
+    for (i = 0; haystack[i] && i < 127; i++) h[i] = (char)tolower((unsigned char)haystack[i]);
+    h[i] = '\0';
+    for (i = 0; needle[i] && i < 63; i++) n[i] = (char)tolower((unsigned char)needle[i]);
+    n[i] = '\0';
+    return strstr(h, n) != NULL;
+}
+
+static void search_filter_fn(const char *query, int *results, int *count) {
+    *count = 0;
+    for (int id = 1; id <= 100 && *count < SEARCH_MAX_RESULTS; id++) {
+        const Effect *e = get_effect(id);
+        if (!e) continue;
+        char id_str[8];
+        snprintf(id_str, sizeof(id_str), "%d", id);
+        if (!query[0] || search_match(id_str, query) || search_match(e->name, query))
+            results[(*count)++] = id;
+    }
+}
 
 /* Returns 1 if effect n has a popup (param_count > 0) */
 static int popup_has_template(int n) {
@@ -262,6 +294,10 @@ static void popup_apply_preview(void) {
 static void popup_render(SDL_Renderer *ren, int win_h) {
     if (!popup_active || !ren) return;
 
+    int fh = font_active ? TTF_FontHeight(font_active) : 16;
+    int lh = fh + 4;   /* line height for hints */
+    int ph = fh + 6;   /* row height per param block (label + bar) */
+
     /* Dark panel background */
     SDL_SetRenderDrawColor(ren, 18, 18, 24, 255);
     SDL_Rect panel = { popup_panel_x, 0, POPUP_W, win_h };
@@ -277,50 +313,50 @@ static void popup_render(SDL_Renderer *ren, int win_h) {
 
     /* Title */
     draw_text(ren, x, y, popup_cur.name, 255, 220, 60);
-    y += 22;
+    y += fh + 8;
     SDL_SetRenderDrawColor(ren, 55, 55, 70, 255);
     SDL_RenderDrawLine(ren, x, y, xe, y);
-    y += 14;
+    y += 10;
 
     /* Params */
     for (int i = 0; i < popup_cur.param_count; i++) {
         EffectParam *p = &popup_cur.params[i];
         int sel = (i == popup_sel);
 
-        /* Label line */
+        /* Label */
         char lbuf[48];
         snprintf(lbuf, sizeof(lbuf), "%d  %s", i + 1, p->label);
         draw_text(ren, x, y, lbuf,
                   sel ? 255 : 140, sel ? 220 : 140, sel ? 60 : 140);
-        y += 15;
+        y += fh + 4;
 
         /* Bar + value */
-        int bar_w = xe - x - 32;
+        int bar_h = 6;
+        int bar_w = xe - x - 36;
         int fill  = bar_w * p->value / (p->max_val > 0 ? p->max_val : 1);
         SDL_SetRenderDrawColor(ren, 35, 35, 50, 255);
-        SDL_Rect bg = { x, y, bar_w, 7 };
+        SDL_Rect bg = { x, y, bar_w, bar_h };
         SDL_RenderFillRect(ren, &bg);
         if (fill > 0) {
             SDL_SetRenderDrawColor(ren, sel ? 90:50, sel ? 180:110, sel ? 60:40, 255);
-            SDL_Rect fg = { x, y, fill, 7 };
+            SDL_Rect fg = { x, y, fill, bar_h };
             SDL_RenderFillRect(ren, &fg);
         }
         char vbuf[12];
         snprintf(vbuf, sizeof(vbuf), "%d", p->value);
-        draw_text(ren, x + bar_w + 4, y - 2, vbuf, 190, 190, 190);
-        y += 20;
+        draw_text(ren, x + bar_w + 6, y - (fh - bar_h) / 2, vbuf, 190, 190, 190);
+        y += ph;
     }
 
-    y += 10;
+    y += 8;
     SDL_SetRenderDrawColor(ren, 55, 55, 70, 255);
     SDL_RenderDrawLine(ren, x, y, xe, y);
-    y += 12;
+    y += 10;
 
-    draw_text(ren, x, y, "+/-  adjust",  65, 65, 85); y += 14;
-    draw_text(ren, x, y, "1-8  select",  65, 65, 85); y += 14;
-    draw_text(ren, x, y, "ENTER  apply", 65, 65, 85); y += 14;
-    draw_text(ren, x, y, "ESC  cancel",  65, 65, 85); y += 14;
-    draw_text(ren, x, y, "This is the demo preview.",  65, 65, 85);
+    draw_text(ren, x, y, "+/-  adjust",  65, 65, 85); y += lh;
+    draw_text(ren, x, y, "1-8  select",  65, 65, 85); y += lh;
+    draw_text(ren, x, y, "ENTER  apply", 65, 65, 85); y += lh;
+    draw_text(ren, x, y, "ESC  cancel",  65, 65, 85);
 }
 
 /* Free all popup preview resources (call before closing popup) */
@@ -329,6 +365,135 @@ static void popup_free_preview(void) {
     if (popup_preview_og)  { free(popup_preview_og);  popup_preview_og  = NULL; }
     if (popup_preview_tex) { SDL_DestroyTexture(popup_preview_tex); popup_preview_tex = NULL; }
     popup_preview_w = popup_preview_h = 0;
+}
+
+/* Short per-effect note shown in the search popup */
+static const char *effect_note(int id) {
+    switch (id) {
+        case 1: return "lighten image";
+        case 2: return "darken image";
+        case 3: return "cool blue tint";
+        case 4: return "custom function";
+        case 5: return "invert colors";
+        case 6: return "tile/mosaic";
+        case 7: return "gold toning";
+        case 8: return "rainbow overlay";
+        case 9: return "glitch sort";
+        default: return "";
+    }
+}
+
+/* Draw the centered effect-search overlay.
+   Layout is driven by font_active metrics — adapts automatically to
+   windowed (font_sm/12pt) and fullscreen (font_lg/17pt). */
+static void search_render(SDL_Renderer *ren, int win_w, int win_h,
+                          const char *query, int sel, int *results, int count,
+                          float ps) {
+    (void)ps; /* no longer used; font_active handles sizing */
+
+    int fh     = font_active ? TTF_FontHeight(font_active) : 16;
+    int row_h  = fh + 5;
+    int pad    = fh;
+    int hdr_h  = fh + 14;
+    int hint_h = fh + 4;
+    int body_h = (count > 0 ? count : 1) * row_h + pad / 2;
+    int sh     = hdr_h + body_h + hint_h + 6;
+    int sw     = win_w / 2;
+    if (sw < 340) sw = 340;
+    if (sw > 640) sw = 640;
+    int sx     = (win_w - sw) / 2;
+    int sy     = win_h / 5;
+
+    /* Column x positions */
+    int col_id   = sx + pad / 2;
+    int col_name = col_id + fh * 2;
+    int col_note = col_name + sw / 3;
+
+    /* Semi-transparent dim overlay */
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(ren, 0, 0, 0, 160);
+    SDL_Rect overlay = { 0, 0, win_w, win_h };
+    SDL_RenderFillRect(ren, &overlay);
+    SDL_SetRenderDrawBlendMode(ren, SDL_BLENDMODE_NONE);
+
+    /* Panel background */
+    SDL_SetRenderDrawColor(ren, 18, 18, 26, 255);
+    SDL_Rect panel = { sx, sy, sw, sh };
+    SDL_RenderFillRect(ren, &panel);
+
+    /* Border */
+    SDL_SetRenderDrawColor(ren, 90, 90, 140, 255);
+    SDL_RenderDrawRect(ren, &panel);
+
+    /* Header: "Search: <query>[autocomplete]_" */
+    {
+        int ty  = sy + (hdr_h - fh) / 2;
+        char prefix[] = "Search: ";
+        draw_text(ren, sx + pad / 2, ty, prefix, 160, 160, 160);
+        int px = sx + pad / 2 + text_width(prefix);
+
+        /* typed query in yellow */
+        if (query[0]) draw_text(ren, px, ty, query, 255, 220, 60);
+
+        /* autocomplete suffix: show if query is a case-insensitive prefix */
+        int qw = 0;
+        if (query[0] && font_active)
+            TTF_SizeText(font_active, query, &qw, NULL);
+        if (count > 0 && query[0]) {
+            const Effect *eff = get_effect(results[0]);
+            if (eff) {
+                int qlen = (int)strlen(query);
+                int nlen = (int)strlen(eff->name);
+                int match = (nlen > qlen);
+                for (int i = 0; i < qlen && match; i++)
+                    if (tolower((unsigned char)query[i]) !=
+                        tolower((unsigned char)eff->name[i])) match = 0;
+                if (match)
+                    draw_text(ren, px + qw, ty, eff->name + qlen, 65, 65, 65);
+            }
+        }
+        draw_text(ren, px + qw, ty, "_", 255, 220, 60);
+    }
+
+    /* Separator */
+    SDL_SetRenderDrawColor(ren, 55, 55, 80, 255);
+    SDL_RenderDrawLine(ren, sx, sy + hdr_h, sx + sw, sy + hdr_h);
+
+    /* Results */
+    if (count == 0) {
+        draw_text(ren, col_id, sy + hdr_h + pad / 2, "No results", 70, 70, 90);
+    } else {
+        for (int i = 0; i < count; i++) {
+            int ry     = sy + hdr_h + pad / 2 + i * row_h;
+            int is_sel = (i == sel);
+            if (is_sel) {
+                SDL_SetRenderDrawColor(ren, 35, 55, 80, 255);
+                SDL_Rect selrect = { sx + 1, ry - 2, sw - 2, row_h };
+                SDL_RenderFillRect(ren, &selrect);
+            }
+            const Effect *eff = get_effect(results[i]);
+            if (!eff) continue;
+
+            /* ID column */
+            char idbuf[8];
+            snprintf(idbuf, sizeof(idbuf), "%d", results[i]);
+            draw_text(ren, col_id, ry,
+                      idbuf, is_sel ? 130:70, is_sel ? 180:80, is_sel ? 255:100);
+
+            /* Name column */
+            draw_text(ren, col_name + (is_sel ? 3 : 0), ry, eff->name,
+                      is_sel ? 255:190, is_sel ? 220:190, is_sel ? 60:190);
+
+            /* Note column */
+            const char *note = effect_note(results[i]);
+            if (note[0])
+                draw_text(ren, col_note, ry, note, 70, 70, 90);
+        }
+    }
+
+    /* Bottom hint */
+    draw_text(ren, sx + pad / 2, sy + sh - hint_h,
+              "UP/DOWN  TAB = complete  ENTER = apply  ESC = close", 50, 50, 70);
 }
 
 /* Open panel: save pixels, build downscaled preview, expand window */
@@ -381,10 +546,27 @@ int main(int argc, char *argv[]) {
     char dialog_path[MAX_PATH] = {0};
     printf("Bogoshop v%s launched\n", BOGOSHOP_VERSION); fflush(stdout);
 
+    /* ── SDL + TTF einmalig initialisieren ─────────────────────────────── */
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) return 1;
+    if (TTF_Init() != 0) { SDL_Quit(); return 1; }
+
+    /* ── Schrift laden ──────────────────────────────────────────────────── */
+    {
+        char font_path[MAX_PATH];
+        get_exe_dir(font_path, sizeof(font_path));
+        strncat(font_path, "assets/JetBrainsMono-Regular.ttf",
+                sizeof(font_path) - strlen(font_path) - 1);
+        font_sm = TTF_OpenFont(font_path, 12);
+        font_lg = TTF_OpenFont(font_path, 17);
+        font_xl = TTF_OpenFont(font_path, 64);
+        if (!font_sm || !font_lg || !font_xl)
+            fprintf(stderr, "Font load failed: %s\n", TTF_GetError());
+        font_active = font_sm;
+    }
+
     /* ── Lizenz prüfen ── */
     if (!load_license()) {
         /* Temporäres Fenster für den Lizenz-Screen */
-        if (SDL_Init(SDL_INIT_VIDEO) != 0) return 1;
         SDL_Window   *lwin = SDL_CreateWindow("Bogoshop",
                                 SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                 480, 320, 0);
@@ -394,8 +576,13 @@ int main(int argc, char *argv[]) {
         int ok = show_license_screen(lwin, lren);
         SDL_DestroyRenderer(lren);
         SDL_DestroyWindow(lwin);
-        SDL_Quit();
-        if (!ok) return 0;
+        if (!ok) {
+            if (font_sm) TTF_CloseFont(font_sm);
+            if (font_lg) TTF_CloseFont(font_lg);
+            if (font_xl) TTF_CloseFont(font_xl);
+            TTF_Quit(); SDL_Quit();
+            return 0;
+        }
     }
 
     if (argc < 2) {
@@ -472,15 +659,11 @@ int main(int argc, char *argv[]) {
     ctx.undo_head  = 0;
     ctx.undo_count = 0;
 
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-        fprintf(stderr, "SDL Init failed: %s\n", SDL_GetError());
-        stbi_image_free(ctx.pixels);
-        return 1;
-    }
-
     float zoom_level  = 1.0f;
     int   mirror_mode = 0;
     int   fullscreen  = 0;
+    float ui_scale    = 1.0f;   /* 1.0 windowed, 1.5 fullscreen */
+    int   fs_saved_win_w = 0, fs_saved_win_h = 0;
     int   pending_save = 0;
     int   pending_quit = 0;
     int   res_mode         = 0;  /* 0=off  1=canvas resize mode active */
@@ -524,8 +707,10 @@ int main(int argc, char *argv[]) {
     );
     SDL_UpdateTexture(ctx.tex, NULL, ctx.pixels, ctx.w * 4);
 
+
+
     SDL_Rect dst   = { BORDER, BORDER, draw_w, draw_h };
-    float    bot_y = BORDER + draw_h + (BORDER - 13) / 2.0f;
+    float    bot_y = 0; /* computed each frame below */
 
     char input[16] = {0};
     int  input_len       = 0;
@@ -542,6 +727,13 @@ int main(int argc, char *argv[]) {
     int  help_preview_h    = 0;
     static char help_lines[HELP_MAX_LINES][HELP_LINE_LEN];
 
+    int   search_active    = 0;
+    char  search_input[64] = {0};
+    int   search_len       = 0;
+    int   search_sel       = 0;
+    int   search_results[SEARCH_MAX_RESULTS];
+    int   search_count     = 0;
+
     SDL_Event e;
     int running = 1;
     while (running) {
@@ -551,8 +743,50 @@ int main(int argc, char *argv[]) {
             if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
 
+                /* ── Search popup keys (intercept all input) ───────── */
+                if (search_active) {
+                    if (k == SDLK_ESCAPE) {
+                        search_active = 0;
+                        search_input[0] = '\0'; search_len = 0;
+                        SDL_StopTextInput();
+                    } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                        if (search_count > 0) {
+                            int sel_id = search_results[search_sel];
+                            search_active = 0;
+                            search_input[0] = '\0'; search_len = 0;
+                            SDL_StopTextInput();
+                            if (popup_has_template(sel_id)) {
+                                popup_open(sel_id, win, win_w, win_h);
+                                snprintf(last_effect, sizeof(last_effect), "%s...", popup_cur.name);
+                            } else {
+                                const char *name = on_number_confirmed(sel_id);
+                                if (name) snprintf(last_effect, sizeof(last_effect), "%s", name);
+                                else      snprintf(last_effect, sizeof(last_effect), "???");
+                            }
+                            input_confirmed = 1; input_len = 0; input[0] = '\0';
+                        }
+                    } else if (k == SDLK_UP) {
+                        if (search_sel > 0) search_sel--;
+                    } else if (k == SDLK_DOWN) {
+                        if (search_sel < search_count - 1) search_sel++;
+                    } else if (k == SDLK_BACKSPACE && search_len > 0) {
+                        search_input[--search_len] = '\0';
+                        search_filter_fn(search_input, search_results, &search_count);
+                        if (search_sel >= search_count) search_sel = search_count > 0 ? search_count - 1 : 0;
+                    } else if (k == SDLK_TAB && search_count > 0) {
+                        /* Autocomplete: fill in first result's name */
+                        const Effect *eff = get_effect(search_results[0]);
+                        if (eff) {
+                            strncpy(search_input, eff->name, sizeof(search_input) - 1);
+                            search_input[sizeof(search_input) - 1] = '\0';
+                            search_len = (int)strlen(search_input);
+                            search_filter_fn(search_input, search_results, &search_count);
+                            search_sel = 0;
+                        }
+                    }
+                }
                 /* ── Popup panel keys (intercept all input) ────────── */
-                if (popup_active) {
+                else if (popup_active) {
                     if (k == SDLK_ESCAPE) {
                         /* cancel: restore original pixels */
                         if (popup_saved_px) {
@@ -599,16 +833,18 @@ int main(int argc, char *argv[]) {
                     }
                 } else {
 
-#define HELP_WIN_W 780
-#define HELP_WIN_H 680
+#define HELP_WIN_W 900
+#define HELP_WIN_H 740
                 /* ── Global keys (all non-popup modes) ─────────────────── */
                 if (k == SDLK_h) {
                     if (help_mode) {
                         help_mode = 0;
-                        win_w = help_saved_win_w;
-                        win_h = help_saved_win_h;
-                        SDL_SetWindowSize(ctx.win, win_w, win_h);
-                        SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                        if (!fullscreen) {
+                            win_w = help_saved_win_w;
+                            win_h = help_saved_win_h;
+                            SDL_SetWindowSize(ctx.win, win_w, win_h);
+                            SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                        }
                         if (help_tex_before) { SDL_DestroyTexture(help_tex_before); help_tex_before = NULL; }
                         if (help_tex_after)  { SDL_DestroyTexture(help_tex_after);  help_tex_after  = NULL; }
                     } else {
@@ -623,12 +859,14 @@ int main(int argc, char *argv[]) {
                         }
                         help_line_count = load_help(path, help_lines, HELP_MAX_LINES);
                         if (help_line_count > 0) {
-                            help_saved_win_w = win_w;
-                            help_saved_win_h = win_h;
-                            win_w = HELP_WIN_W;
-                            win_h = HELP_WIN_H;
-                            SDL_SetWindowSize(ctx.win, win_w, win_h);
-                            SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                            if (!fullscreen) {
+                                help_saved_win_w = win_w;
+                                help_saved_win_h = win_h;
+                                win_w = HELP_WIN_W;
+                                win_h = HELP_WIN_H;
+                                SDL_SetWindowSize(ctx.win, win_w, win_h);
+                                SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                            }
                             help_mode   = 1;
                             help_scroll = 0;
                             input_confirmed = 0;
@@ -646,10 +884,12 @@ int main(int argc, char *argv[]) {
                 } else if (k == SDLK_ESCAPE || k == SDLK_q) {
                     if (help_mode) {
                         help_mode = 0;
-                        win_w = help_saved_win_w;
-                        win_h = help_saved_win_h;
-                        SDL_SetWindowSize(ctx.win, win_w, win_h);
-                        SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                        if (!fullscreen) {
+                            win_w = help_saved_win_w;
+                            win_h = help_saved_win_h;
+                            SDL_SetWindowSize(ctx.win, win_w, win_h);
+                            SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+                        }
                         if (help_tex_before) { SDL_DestroyTexture(help_tex_before); help_tex_before = NULL; }
                         if (help_tex_after)  { SDL_DestroyTexture(help_tex_after);  help_tex_after  = NULL; }
                     } else if (pending_quit) {
@@ -685,6 +925,9 @@ int main(int argc, char *argv[]) {
                 } else if (k == SDLK_f && !(e.key.keysym.mod & (KMOD_CTRL | KMOD_SHIFT))) {
                     fullscreen = !fullscreen;
                     SDL_SetWindowFullscreen(win, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    if (!fullscreen) {
+                        SDL_SetWindowSize(win, win_w, win_h);
+                    }
                     SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
                     snprintf(last_effect, sizeof(last_effect), fullscreen ? "Fullscreen ON" : "Fullscreen OFF");
                     input_confirmed = 1; input_len = 0; input[0] = '\0';
@@ -745,6 +988,14 @@ int main(int argc, char *argv[]) {
                     /* Help scroll — global */
                     if (k == SDLK_UP   && help_scroll > 0) help_scroll--;
                     if (k == SDLK_DOWN && help_scroll < help_line_count - 1) help_scroll++;
+                }
+                /* ── Space: open effect search ─────────────────────────── */
+                else if (k == SDLK_SPACE && !help_mode && !pending_save && !pending_quit) {
+                    search_active = 1;
+                    search_input[0] = '\0'; search_len = 0;
+                    search_filter_fn(search_input, search_results, &search_count);
+                    search_sel = 0;
+                    SDL_StartTextInput();
                 }
                 /* ── Composition mode ──────────────────────────────────── */
                 else if (res_mode) {
@@ -973,7 +1224,8 @@ int main(int argc, char *argv[]) {
                             else { if (dst.x > BORDER) dst.x = BORDER; if (dst.x+draw_w < win_w-BORDER) dst.x = win_w-BORDER-draw_w; }
                             if (draw_h <= ih) { dst.y = BORDER; }
                             else { if (dst.y > BORDER) dst.y = BORDER; if (dst.y+draw_h < win_h-BORDER) dst.y = win_h-BORDER-draw_h; }
-                        } }
+                        }
+                        }
                         snprintf(last_effect, sizeof(last_effect), "Zoom %.2fx", zoom_level);
                         input_confirmed = 1; input_len = 0; input[0] = '\0';
                     } else if (k == SDLK_MINUS || k == SDLK_KP_MINUS) {
@@ -993,7 +1245,8 @@ int main(int argc, char *argv[]) {
                             else { if (dst.x > BORDER) dst.x = BORDER; if (dst.x+draw_w < win_w-BORDER) dst.x = win_w-BORDER-draw_w; }
                             if (draw_h <= ih) { dst.y = BORDER; }
                             else { if (dst.y > BORDER) dst.y = BORDER; if (dst.y+draw_h < win_h-BORDER) dst.y = win_h-BORDER-draw_h; }
-                        } }
+                        }
+                        }
                         snprintf(last_effect, sizeof(last_effect), "Zoom %.2fx", zoom_level);
                         input_confirmed = 1; input_len = 0; input[0] = '\0';
                     } else if (k == SDLK_m) {
@@ -1112,6 +1365,17 @@ int main(int argc, char *argv[]) {
 
             if (e.type == SDL_TEXTINPUT) {
                 char c = e.text.text[0];
+                /* Search input: accept all printable chars (skip the opening space) */
+                if (search_active) {
+                    if (c >= 32 && c < 127 && !(search_len == 0 && c == ' ')) {
+                        if (search_len < 63) {
+                            search_input[search_len++] = c;
+                            search_input[search_len]   = '\0';
+                            search_filter_fn(search_input, search_results, &search_count);
+                            search_sel = 0;
+                        }
+                    }
+                } else {
                 int is_digit = (c >= '0' && c <= '9');
                 int is_colon = (c == ':' && input_len > 0 && !strchr(input, ':'));
                 int is_x     = (c == 'x' && res_mode && input_len > 0
@@ -1127,52 +1391,57 @@ int main(int argc, char *argv[]) {
                         input[input_len]   = '\0';
                     }
                 }
+                } /* end else (!search_active) */
             }
         }
 
         if (ctx.needs_layout_update) {
             ctx.needs_layout_update = 0;
             zoom_level = 1.0f;
-            int max_i = MAX_SIZE - 2 * BORDER;
-            float sx = (float)max_i / ctx.w;
-            float sy = (float)max_i / ctx.h;
-            float sc = sx < sy ? sx : sy;
-            base_draw_w = (int)(ctx.w * sc);
-            base_draw_h = (int)(ctx.h * sc);
+            {
+                int max_i = MAX_SIZE - 2 * BORDER;
+                float sx = (float)max_i / ctx.w;
+                float sy = (float)max_i / ctx.h;
+                float sc = sx < sy ? sx : sy;
+                if (sc > 1.0f) sc = 1.0f;
+                base_draw_w = (int)(ctx.w * sc);
+                base_draw_h = (int)(ctx.h * sc);
+                win_w = base_draw_w + 2 * BORDER;
+                win_h = base_draw_h + 2 * BORDER;
+                SDL_SetWindowSize(ctx.win, win_w, win_h);
+                SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+            }
             draw_w = base_draw_w;
             draw_h = base_draw_h;
-            win_w  = draw_w + 2 * BORDER;
-            win_h  = draw_h + 2 * BORDER;
             dst.x  = BORDER;
             dst.y  = BORDER;
             dst.w  = draw_w;
             dst.h  = draw_h;
-            bot_y  = BORDER + draw_h + (BORDER - 13) / 2.0f;
-            SDL_SetWindowSize(ctx.win, win_w, win_h);
-            SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         }
 
         if (comp_dirty) {
             comp_dirty = 0;
             int eff_w = comp_w, eff_h = comp_h;
             zoom_level = 1.0f;
-            int max_i = MAX_SIZE - 2 * BORDER;
-            float sx = (float)max_i / eff_w;
-            float sy = (float)max_i / eff_h;
-            float sc = sx < sy ? sx : sy;
-            base_draw_w = (int)(eff_w * sc);
-            base_draw_h = (int)(eff_h * sc);
+            {
+                int max_i = MAX_SIZE - 2 * BORDER;
+                float sx = (float)max_i / eff_w;
+                float sy = (float)max_i / eff_h;
+                float sc = sx < sy ? sx : sy;
+                if (sc > 1.0f) sc = 1.0f;
+                base_draw_w = (int)(eff_w * sc);
+                base_draw_h = (int)(eff_h * sc);
+                win_w = base_draw_w + 2 * BORDER;
+                win_h = base_draw_h + 2 * BORDER;
+                SDL_SetWindowSize(ctx.win, win_w, win_h);
+                SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+            }
             draw_w = base_draw_w;
             draw_h = base_draw_h;
-            win_w  = draw_w + 2 * BORDER;
-            win_h  = draw_h + 2 * BORDER;
             dst.x  = BORDER;
             dst.y  = BORDER;
             dst.w  = draw_w;
             dst.h  = draw_h;
-            bot_y  = BORDER + draw_h + (BORDER - 13) / 2.0f;
-            SDL_SetWindowSize(ctx.win, win_w, win_h);
-            SDL_SetWindowPosition(ctx.win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
         }
 
         SDL_SetRenderDrawColor(ctx.ren, bg_r, bg_g, bg_b, 255);
@@ -1180,7 +1449,6 @@ int main(int argc, char *argv[]) {
         if (fullscreen) {
             int aw, ah;
             SDL_GetWindowSize(ctx.win, &aw, &ah);
-            /* In fullscreen, expand viewport to include popup panel if active */
             int vp_w = popup_active ? win_w + POPUP_W : win_w;
             SDL_Rect vp = { (aw - vp_w) / 2, (ah - win_h) / 2, vp_w, win_h };
             SDL_RenderSetViewport(ctx.ren, &vp);
@@ -1252,12 +1520,11 @@ int main(int argc, char *argv[]) {
 
         /* Große zentrierte Zahl über dem Bild während der Eingabe */
         if (input_len > 0 && !popup_active && !res_mode) {
-            float big_scale = 15.0f;
-            float text_w = text_width(input) * big_scale;
-            float text_h = 13.0f * big_scale;
-            float cx = BORDER + (win_w - 2 * BORDER) / 2.0f - text_w / 2.0f;
-            float cy = BORDER + (win_h - 2 * BORDER) * 0.65f - text_h / 2.0f;
-            draw_text_scaled(ctx.ren, cx, cy, input, big_scale, 255, 220, 0);
+            int tw = 0, th = 0;
+            if (font_xl) TTF_SizeText(font_xl, input, &tw, &th);
+            float cx = BORDER + (win_w - 2 * BORDER) / 2.0f - tw / 2.0f;
+            float cy = BORDER + (win_h - 2 * BORDER) * 0.65f - th / 2.0f;
+            draw_text_scaled(ctx.ren, cx, cy, input, 15.0f, 255, 220, 0); /* 15 > 8 → font_xl */
         }
 
         /* Untere Konsole: Effektname nach Enter, sonst Eingabe-Prompt */
@@ -1273,10 +1540,8 @@ int main(int argc, char *argv[]) {
             cb = input_len ?   0 : 120;
         }
         {
-            int avail = win_w - 2 * BORDER;
-            int tw    = text_width(display);
-            float sc  = tw > 0 && tw > avail ? (float)avail / tw : 1.0f;
-            draw_text_scaled(ctx.ren, BORDER, bot_y, display, sc, cr, cg, cb);
+            bot_y = dst.y + draw_h + (BORDER - 13) / 2.0f;
+            draw_text(ctx.ren, BORDER, bot_y, display, cr, cg, cb);
         }
 
         /* ── Help / Doc Modus ──────────────────────────────────────────── */
@@ -1285,7 +1550,11 @@ int main(int argc, char *argv[]) {
             SDL_Rect overlay = { 0, 0, win_w, win_h };
             SDL_RenderFillRect(ctx.ren, &overlay);
 
-            int y_start = BORDER;
+            int fh       = font_active ? TTF_FontHeight(font_active) : 16;
+            int line_h   = fh + 3;
+            /* centred text column — leave 12% margin on each side */
+            int x_margin = win_w / 8;
+            int y_start  = BORDER;
 
             /* Before/After preview images (only for effect docs) */
             if (help_tex_before && help_tex_after) {
@@ -1297,27 +1566,25 @@ int main(int argc, char *argv[]) {
                 SDL_Rect rafter  = { px + help_preview_w + gap,   py, help_preview_w, help_preview_h };
                 SDL_RenderCopy(ctx.ren, help_tex_before, NULL, &rbefore);
                 SDL_RenderCopy(ctx.ren, help_tex_after,  NULL, &rafter);
-                int lbl_y = py + help_preview_h + 3;
+                int lbl_y = py + help_preview_h + 4;
                 draw_text(ctx.ren, px,                         lbl_y, "Before", 140, 140, 140);
                 draw_text(ctx.ren, px + help_preview_w + gap, lbl_y, "After",  120, 220, 120);
-                y_start = lbl_y + 14;
+                y_start = lbl_y + line_h + 4;
             }
 
-            int line_h    = 14;
-            int x_margin  = BORDER;
-            int lines_vis = (win_h - y_start - BORDER - 20) / line_h;
+            int lines_vis = (win_h - y_start - BORDER - line_h) / line_h;
 
             for (int i = 0; i < lines_vis; i++) {
                 int idx = help_scroll + i;
                 if (idx >= help_line_count) break;
                 const char *line = help_lines[idx];
-                float y = y_start + i * line_h;
+                int y = y_start + i * line_h;
                 if (line[0] == '#' && line[1] == '#') {
                     draw_text(ctx.ren, x_margin, y, line + 2, 120, 200, 255);
                 } else if (line[0] == '#') {
                     draw_text_scaled(ctx.ren, x_margin, y, line + 1, 1.3f, 255, 220, 80);
                 } else if (line[0] == '-' || line[0] == '*') {
-                    draw_text(ctx.ren, x_margin + 8, y, line, 180, 180, 180);
+                    draw_text(ctx.ren, x_margin + 12, y, line, 180, 180, 180);
                 } else if (line[0] == '\0') {
                     /* empty line — skip */
                 } else {
@@ -1329,13 +1596,19 @@ int main(int argc, char *argv[]) {
             char hint[48];
             snprintf(hint, sizeof(hint), "[%d/%d] UP/DOWN  H/ESC = close",
                      help_scroll + 1, help_line_count);
-            draw_text(ctx.ren, x_margin, win_h - BORDER / 2 - 6, hint, 80, 80, 80);
+            draw_text(ctx.ren, x_margin, win_h - BORDER / 2 - fh / 2, hint, 80, 80, 80);
         }
 
+        if (search_active)
+            search_render(ctx.ren, win_w, win_h,
+                          search_input, search_sel, search_results, search_count,
+                          ui_scale);
         popup_render(ctx.ren, win_h);
         SDL_RenderPresent(ctx.ren);
     }
 
+    /* cleanup search if still open */
+    if (search_active) SDL_StopTextInput();
     /* cleanup popup if still open */
     if (popup_saved_px) { free(popup_saved_px); popup_saved_px = NULL; }
     popup_free_preview();
@@ -1348,6 +1621,10 @@ int main(int argc, char *argv[]) {
     SDL_DestroyTexture(ctx.tex);
     SDL_DestroyRenderer(ctx.ren);
     SDL_DestroyWindow(win);
+    if (font_sm) TTF_CloseFont(font_sm);
+    if (font_lg) TTF_CloseFont(font_lg);
+    if (font_xl) TTF_CloseFont(font_xl);
+    TTF_Quit();
     SDL_Quit();
     return 0;
 }

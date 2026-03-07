@@ -13,7 +13,6 @@
 #include <ctype.h>
 #include <time.h>
 
-#include "vendor/stb_easy_font.h"
 #include "license.h"
 #include "render.h"
 
