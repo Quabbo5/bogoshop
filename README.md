@@ -1,2 +1,6 @@
 # Welcome to bogoshop!
-> basic description following
+```bash
+
+$ .\.venv\Scripts\activate
+
+```

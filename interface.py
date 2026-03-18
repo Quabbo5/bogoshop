@@ -1,12 +1,13 @@
 from tkinter import *
 from tkinter import ttk
 import time
+import random
 import numpy as np
 from PIL import Image, ImageTk
 
 # resize
 def _resize(path):
-    img = Image.open("img2.jpg")
+    img = Image.open("test_image.png")
     _W, _H = img.size
     if _W == _H:
         return img
@@ -32,20 +33,12 @@ main.add(left_panel)
 list_title = Label(left_panel, text="Select Effect:")
 left_panel.add(list_title)
 
-# create list
-effect_list = Listbox(left_panel)
-effect_list.insert(1, "0001# Threshold")
-effect_list.insert(2, "0002# Negative")
-effect_list.insert(3,"0003# Glow")
-
-left_panel.add(effect_list)
-
 # build right panel
 right_panel = PanedWindow(main, orient= VERTICAL)
 main.add(right_panel)
 
 # build header
-header_widget = Label(right_panel, text="Dont do silly stuff or the gods of beyond the worlds will devour your soul")
+header_widget = Label(right_panel, text="Limboshop")
 right_panel.add(header_widget)
 # header_widget.insert(END, "This is the message of the day")
 
@@ -74,30 +67,7 @@ id_input_entry.pack()
 progress_bar = ttk.Progressbar(right_panel, orient= HORIZONTAL, length=300, mode= "determinate")
 right_panel.add(progress_bar)
 
-# handle input
-def on_click(event):
-    selection = effect_list.curselection()
-    if selection: 
-        index = selection[0]
-        _apply_effect(index)
-
-effect_list.bind("<Double-Button-1>", on_click)
-
-# apply effect
-def _apply_effect(index):
-    if index == 0:
-        _blackAndWhiteThreshold()
-    if index == 1:
-        _negative()
-    if index == 2:
-        _glow()
-    new_img = crop_image.resize((800, 800))
-    new_canvas = ImageTk.PhotoImage(new_img)
-    image.config(image=new_canvas)
-    image.image = new_canvas
-
-# define effects
-
+# effects
 def _blackAndWhiteThreshold():
     USER_INPUT = 230
     _W, _H = crop_image.size
@@ -151,7 +121,6 @@ def _glow():
     arr = np.array(crop_image)
     base = Image.fromarray(arr)
     
-    # mehrfach unscharf machen und hell aufblenden
     blur = base.filter(ImageFilter.GaussianBlur(radius=15))
     blur_arr = np.array(blur)
     
@@ -163,23 +132,55 @@ def _glow():
     root.update_idletasks()
     root.after(800, lambda: progress_bar.configure(value=0))
 
+def _color_grain():
+    global crop_image
+    _W, _H = crop_image.size
+    progress_bar["value"] = 0
+
+    arr = np.array(crop_image).astype(np.float32)
+    grain = np.random.randint(0, 256, (_H, _W, 3), dtype=np.uint8).astype(np.float32)
+
+    strength = 0.3
+    arr[..., :3] = np.clip(arr[..., :3] * (1 - strength) + grain * strength, 0, 255)
+
+    crop_image = Image.fromarray(arr.astype(np.uint8))
+    progress_bar["value"] = 100
+    root.update_idletasks()
+    root.after(20, lambda: progress_bar.configure(value=0))
+
 # struct
 EFFECTS = [
     {"id": "0001", "name": "Threshold", "fn": _blackAndWhiteThreshold},
     {"id": "0002", "name": "Negative",  "fn": _negative},
     {"id": "0003", "name": "Glow",      "fn": _glow},
+    {"id": "0004", "name": "Color Grain", "fn": _color_grain}
 ]
 
+# build list
+effect_list = Listbox(left_panel)
+for e in EFFECTS:
+    effect_list.insert(END, f"{e['id']} - {e['name']}")
 
+left_panel.add(effect_list)
 
+# handle input
+def on_click(event):
+    selection = effect_list.curselection()
+    if selection: 
+        index = selection[0]
+        _apply_effect(index)
 
+# apply effect
+def _apply_effect(index):
+    EFFECTS[index]["fn"]()
 
+    new_img = crop_image.resize((800, 800))
+    new_canvas = ImageTk.PhotoImage(new_img)
+    image.config(image=new_canvas)
+    image.image = new_canvas
 
-
-
-
-
-
+# keybinds
+effect_list.bind("<Double-Button-1>", on_click)
 
 # run
 root.mainloop()
