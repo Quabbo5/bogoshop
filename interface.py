@@ -21,10 +21,6 @@ def _resize(path):
 root = Tk()
 root.title("Limboshop")
 
-# set theme
-style = ttk.Style()
-style.theme_use("aqua")
-
 # build main container
 main = PanedWindow(root, orient= HORIZONTAL)
 main.pack(fill=BOTH, expand=1)
