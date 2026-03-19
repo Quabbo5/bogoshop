@@ -3,12 +3,22 @@ from tkinter import ttk
 from tkinter import colorchooser
 from PIL import Image, ImageTk
 import numpy as np
+import ctypes
 
 class App:
     def __init__(self):
 
         self.root = Tk()
         self.root.title("Bogoshop")
+        self.root.geometry("1000x950")
+        self.root.minsize(1000, 950)
+        #self.root.state("zoomed")
+        self.root.config(bg="black")
+
+        # dunkle Titelleiste (Windows 10/11)
+        self.root.update()
+        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
 
         # build menu
         self.menu_bar = Menu(self.root)
@@ -31,50 +41,57 @@ class App:
         self.img_canvas = ImageTk.PhotoImage(self.img)
 
         # build main container
-        self.main = PanedWindow(self.root, orient=HORIZONTAL)
+        self.main = PanedWindow(self.root, orient=HORIZONTAL, bg="#2D2D2D")
         self.main.pack(fill=BOTH, expand=1)
 
         # build left panel
-        self.left_panel = PanedWindow(self.main, orient=VERTICAL)
-        self.main.add(self.left_panel)
+        self.left_border = Frame(self.main, highlightbackground="#444444", highlightthickness=1, bg="#2D2D2D")
+        self.main.add(self.left_border)
+        self.left_panel = PanedWindow(self.left_border, orient=VERTICAL, bg="#2D2D2D")
+        self.left_panel.pack(fill=BOTH, expand=1)
 
-        self.list_title = Label(self.left_panel, text="Select Effect:", font="Plus_Jakarta_Sans 8 bold", anchor="nw", width=20)
+        self.list_title = Label(self.left_panel, text="Select Effect:", font="Plus_Jakarta_Sans 8 bold", anchor="nw", width=20, bg="#2D2D2D", fg="#f5f5f5")
         self.left_panel.add(self.list_title)
 
         # build right panel
-        self.right_panel = PanedWindow(self.main, orient=VERTICAL, bg="#2D2D2D")
-        self.main.add(self.right_panel)
+        self.right_border = Frame(self.main, highlightbackground="#444444", highlightthickness=1, bg="#2D2D2D")
+        self.main.add(self.right_border)
+        self.right_panel = PanedWindow(self.right_border, orient=VERTICAL, bg="#2D2D2D")
+        self.right_panel.pack(fill=BOTH, expand=1)
 
         # build header
-        self.header_widget = Label(self.right_panel, text="BOGOSHOP v.0.2", font="Plus_Jakarta_Sans 8 bold")
+        self.header_widget = Label(self.right_panel, text="BOGOSHOP v.0.2", font="Plus_Jakarta_Sans 8 bold", bg="#2D2D2D", fg="#f5f5f5")
         self.right_panel.add(self.header_widget)
 
         # build canvas
-        self.image_canvas = PanedWindow(self.main, orient=VERTICAL)
+        self.image_canvas = PanedWindow(self.main, orient=VERTICAL, bg="#2D2D2D")
         self.right_panel.add(self.image_canvas)
 
-        self.image_label = Label(self.right_panel, image=self.img_canvas)
+        self.image_label = Label(self.right_panel, image=self.img_canvas, bg="#1B1B1B")
         self.right_panel.add(self.image_label, padx=30, pady=30)
 
         # build textbox frame
-        self.input_frame = Frame(self.right_panel)
+        self.input_frame = Frame(self.right_panel, bg="#2D2D2D")
         self.right_panel.add(self.input_frame, minsize=20)
 
-        self.id_input_field = Label(self.input_frame, text="Enter Effect ID:", font="Plus_Jakarta_Sans 8 bold")
+        self.id_input_field = Label(self.input_frame, text="Enter Effect ID:", font="Plus_Jakarta_Sans 8 bold", bg="#2D2D2D", fg="#f5f5f5")
         self.id_input_field.pack()
-        self.id_input_entry = Entry(self.input_frame, width=30)
+        self.id_input_entry = Entry(self.input_frame, width=30, bg="#3C3C3C", fg="#f5f5f5", insertbackground="#f5f5f5")
         self.id_input_entry.pack()
 
         # build progressbar
-        self.progress_bar = ttk.Progressbar(self.right_panel, orient=HORIZONTAL, length=300, mode="determinate")
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("dark.Horizontal.TProgressbar",troughcolor="#3C3C3C", background="#7C7CFF", darkcolor="#7C7CFF", lightcolor="#7C7CFF", bordercolor="#2D2D2D")
+        self.progress_bar = ttk.Progressbar(self.right_panel, orient=HORIZONTAL, length=300, mode="determinate", style="dark.Horizontal.TProgressbar")
         self.right_panel.add(self.progress_bar)
 
         # build effect list
-        self.effect_list = Listbox(self.left_panel, font="Plus_Jakarta_Sans 10")
+        self.effect_list = Listbox(self.left_panel, font="Plus_Jakarta_Sans 10", bg="#2D2D2D", fg="#f5f5f5", highlightthickness=0, bd=0)
         self.left_panel.add(self.effect_list)
 
         self.EFFECTS = [
-            {"id": "0001", "name": "Posterize 1bit", "fn": self._posterize_1bit, "author": "rango"},
+            {"id": "0001", "name": "Posterize 1bit", "fn": self._posterize_1bit, "author": "lea"},
             {"id": "0002", "name": "Negative", "fn": self._negative, "author": "rango"},
             {"id": "0003", "name": "Glow", "fn": self._glow, "author": "rango"},
             {"id": "0004", "name": "Color Grain", "fn": self._color_grain, "author": "rango"},
@@ -216,6 +233,7 @@ class App:
     def _posterize_3bit(self):
         def _step(i):
             return 255 / 7 * i
+            
 
         _W, _H = self.current_image.size
         arr = np.array(self.current_image)
