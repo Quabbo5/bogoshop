@@ -4,21 +4,24 @@ from tkinter import colorchooser
 from PIL import Image, ImageTk
 import numpy as np
 import ctypes
+from PIL import ImageFilter
+import colorsys
+import cv2
 
 class App:
     def __init__(self):
 
         self.root = Tk()
         self.root.title("Bogoshop")
-        self.root.geometry("1000x950")
-        self.root.minsize(1000, 950)
+        self.root.geometry("1050x860")
+        self.root.minsize(1050, 860)
         #self.root.state("zoomed")
         self.root.config(bg="black")
 
         # dunkle Titelleiste (Windows 10/11)
-        self.root.update()
-        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
+        # self.root.update()
+        # hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+        # ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(ctypes.c_int(1)), ctypes.sizeof(ctypes.c_int))
 
         # build menu
         self.menu_bar = Menu(self.root)
@@ -36,7 +39,7 @@ class App:
 
         self.help_menu.add_command(label="Open Documentation")
 
-        self.current_image = self._resize("img/jpegs/img2.jpg")
+        self.current_image = self._resize("img/jpegs/gloomerald.jpg")
         self.img = self.current_image.resize((800, 800))
         self.img_canvas = ImageTk.PhotoImage(self.img)
 
@@ -59,6 +62,12 @@ class App:
         self.right_panel = PanedWindow(self.right_border, orient=VERTICAL, bg="#2D2D2D")
         self.right_panel.pack(fill=BOTH, expand=1)
 
+        # build effect panel
+        #self.effect_border = Frame(self.main, highlightbackground="#363636", highlightthickness=1, bg="#2D2D2D")
+        #self.main.add(self.effect_border)
+        #self.effect_panel = PanedWindow(self.effect_border, orient=VERTICAL, bg="#2D2D2D")
+        #self.effect_panel.pack(fill=BOTH, expand=1)
+
         # build header
         self.header_widget = Label(self.right_panel, text="BOGOSHOP v.0.2", font="Plus_Jakarta_Sans 8 bold", bg="#2D2D2D", fg="#f5f5f5")
         self.right_panel.add(self.header_widget)
@@ -68,35 +77,45 @@ class App:
         self.right_panel.add(self.image_canvas)
 
         self.image_label = Label(self.right_panel, image=self.img_canvas, bg="#1B1B1B")
-        self.right_panel.add(self.image_label, padx=30, pady=30)
+        self.right_panel.add(self.image_label, padx=30, pady=0)
 
         # build textbox frame
-        self.input_frame = Frame(self.right_panel, bg="#2D2D2D")
-        self.right_panel.add(self.input_frame, minsize=20)
+        # self.input_frame = Frame(self.right_panel, bg="#2D2D2D")
+        # self.right_panel.add(self.input_frame, minsize=20)
 
-        self.id_input_field = Label(self.input_frame, text="Enter Effect ID:", font="Plus_Jakarta_Sans 8 bold", bg="#2D2D2D", fg="#f5f5f5")
-        self.id_input_field.pack()
-        self.id_input_entry = Entry(self.input_frame, width=30, bg="#3C3C3C", fg="#f5f5f5", insertbackground="#f5f5f5")
-        self.id_input_entry.pack()
+        # self.id_input_field = Label(self.input_frame, text="Enter Effect ID:", font="Plus_Jakarta_Sans 8 bold", bg="#2D2D2D", fg="#f5f5f5")
+        # self.id_input_field.pack()
+        # self.id_input_entry = Entry(self.input_frame, width=30, bg="#3C3C3C", fg="#f5f5f5", insertbackground="#f5f5f5")
+        # self.id_input_entry.pack()
 
         # build progressbar
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure("dark.Horizontal.TProgressbar",troughcolor="#3C3C3C", background="#7C7CFF", darkcolor="#7C7CFF", lightcolor="#7C7CFF", bordercolor="#2D2D2D")
-        self.progress_bar = ttk.Progressbar(self.right_panel, orient=HORIZONTAL, length=300, mode="determinate", style="dark.Horizontal.TProgressbar")
-        self.right_panel.add(self.progress_bar)
+        self.progress_bar_frame = Frame(self.right_panel, bg="#2D2D2D", height=6)
+        self.right_panel.add(self.progress_bar_frame)
+
+        self.progress_bar = ttk.Progressbar(self.progress_bar_frame, orient=HORIZONTAL, mode="determinate", style="dark.Horizontal.TProgressbar")
+        self.progress_bar.pack(anchor="s",fill=X,side=BOTTOM)
 
         # build effect list
         self.effect_list = Listbox(self.left_panel, font="Plus_Jakarta_Sans 10", bg="#2D2D2D", fg="#f5f5f5", highlightthickness=0, bd=0)
         self.left_panel.add(self.effect_list)
 
+        # build effect panel
+        #self.example_effect = Label(self.effect_panel, text="This is my example text")
+        #self.effect_panel.add(self.example_effect)
+
+        #self.scale_test = Scale(self.effect_panel, orient=HORIZONTAL)
+        #self.effect_panel.add(self.scale_test)
+
         self.EFFECTS = [
-            {"id": "0001", "name": "Posterize 1bit", "fn": self._posterize_1bit, "author": "lea"},
-            {"id": "0002", "name": "Negative", "fn": self._negative, "author": "rango"},
-            {"id": "0003", "name": "Glow", "fn": self._glow, "author": "rango"},
-            {"id": "0004", "name": "Color Grain", "fn": self._color_grain, "author": "rango"},
-            {"id": "0005", "name": "RedThreshold", "fn": self._duotone_threshold, "author": "rango"},
-            {"id": "0006", "name": "Posterize 3bit", "fn": self._posterize_3bit, "author": "rango"},
+            {"id": "1", "name": "Posterize 1bit", "fn": self._posterize_1bit, "author": "lea"},
+            {"id": "2", "name": "Negative", "fn": self._negative, "author": "rango"},
+            {"id": "3", "name": "Glow", "fn": self._glow, "author": "rango"},
+            {"id": "4", "name": "Color Grain", "fn": self._color_grain, "author": "rango"},
+            {"id": "5", "name": "RedThreshold", "fn": self._duotone_threshold, "author": "rango"},
+            {"id": "6", "name": "Posterize 3bit", "fn": self._posterize_3bit, "author": "rango"},
+            {"id": "7", "name": "Hue shift", "fn": self._hue_shift, "author": "rango"},
+            {"id": "8", "name": "Brightness Up", "fn": self._brightness_up, "author": "rango"},
+            {"id": "9", "name": "Brightness Down", "fn": self._brightness_down, "author": "rango"}
         ]
 
         for e in self.EFFECTS:
@@ -105,6 +124,7 @@ class App:
         # keybinds
         self.effect_list.bind("<Double-Button-1>", self._on_click)
         self.effect_list.bind("<h>", self._on_h_press)
+        # self.id_input_entry.bind("<Return>", self._on_enter)
 
         self.root.mainloop()
 
@@ -115,6 +135,14 @@ class App:
         if selection:
             index = selection[0]
             self._apply_effect(index)
+    
+    def _on_enter(self, event):
+        value = self.id_input_entry.get().strip()
+
+        for i, effect in enumerate(self.EFFECTS):
+            if effect["id"] == value:
+                self._apply_effect(i)
+                return
 
     def _on_h_press(self, event):
         selection = self.effect_list.curselection()
@@ -125,7 +153,7 @@ class App:
     # --- core ---
 
     def _resize(self, path):
-        img = Image.open("img/jpegs/desert.jpg")
+        img = Image.open("img/jpegs/gloomerald.jpg")
         _W, _H = img.size
         if _W == _H:
             return img
@@ -142,6 +170,53 @@ class App:
         new_canvas = ImageTk.PhotoImage(new_img)
         self.image_label.config(image=new_canvas)
         self.image_label.image = new_canvas
+    
+    def _insert_with_bold_italic(self, widget, line, tag):
+    # erst ** splitten, dann * innerhalb der teile
+        parts = line.split("**")
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                widget.insert(END, part, "bold")
+            else:
+                # jetzt auf kursiv prüfen
+                italic_parts = part.split("*")
+                for j, ipart in enumerate(italic_parts):
+                    if j % 2 == 1:
+                        widget.insert(END, ipart, "italic")
+                    else:
+                        widget.insert(END, ipart, tag)
+        widget.insert(END, "\n")
+
+    def _render_markdown(self, widget, text):
+        widget.config(state=NORMAL)
+        widget.delete("1.0", END)
+
+        in_code_block = False
+
+        for line in text.split("\n"):
+            if line.startswith("```"):
+                in_code_block = not in_code_block
+                continue
+            if in_code_block:
+                widget.insert(END, line + "\n", "code")
+                continue
+            if line.startswith("# "):
+                self._insert_with_bold_italic(widget, line[2:], "h1")
+            elif line.startswith("## "):
+                self._insert_with_bold_italic(widget, line[3:], "h2")
+            elif line.startswith("- "):
+                self._insert_with_bold_italic(widget, "• " + line[2:], "normal")
+            elif line.startswith("```"):
+                pass
+            else:
+                self._insert_with_bold_italic(widget, line, "normal")
+        widget.tag_config("h1", font="Plus_Jakarta_Sans 18 bold", foreground="#f5f5f5")
+        widget.tag_config("h2", font="Plus_Jakarta_Sans 14 bold", foreground="#c0c0c0")
+        widget.tag_config("bold", font="Plus_Jakarta_Sans 11 bold", foreground="#B5AFED")
+        widget.tag_config("italic", font="Plus_Jakarta_Sans 11 italic", foreground="#6C65AA")
+        widget.tag_config("normal", font="Plus_Jakarta_Sans 11", foreground="#f5f5f5")
+        widget.tag_config("code", font=("Source Code Pro", 11), foreground="#dbe9ff")
+        widget.config(state=DISABLED)
 
     def _load_wiki(self, index):
         file_path = "img/pngs/waves.png"
@@ -212,14 +287,19 @@ class App:
              ).pack()
         
         with open(f"wiki/{self.EFFECTS[index]['id']}.md", "r") as f:
-            text = f.read()
+            raw_text = f.read()
 
-        wiki.mainloop()
+        wiki_text = Text(wiki, bg="#2D2D2D", relief=FLAT, padx=10, pady=10)
+        wiki_text.pack(fill=BOTH, expand=1)
+        self._render_markdown(wiki_text, raw_text)
+
+        wiki.mainloop()    
 
     # --- effects ---
 
     def _posterize_1bit(self):
         self.progress_bar["value"] = 0
+
         threshold = 140
         arr = np.array(self.current_image)
         rgb = arr[..., :3].astype(np.float32)
@@ -227,14 +307,16 @@ class App:
         arr[luma < threshold, :3] = 0
         arr[luma >= threshold, :3] = 255
         self.current_image = Image.fromarray(arr)
+
         self.progress_bar["value"] = 100
+        self.root.update_idletasks()
         self.root.after(20, lambda: self.progress_bar.configure(value=0))
 
     def _posterize_3bit(self):
+        self.progress_bar["value"] = 0
+
         def _step(i):
             return 255 / 7 * i
-            
-
         _W, _H = self.current_image.size
         arr = np.array(self.current_image)
         rgb = arr[..., :3].astype(np.float32)
@@ -253,7 +335,13 @@ class App:
 
         self.current_image = Image.fromarray(arr)
 
+        self.progress_bar["value"] = 100
+        self.root.update_idletasks()
+        self.root.after(20, lambda: self.progress_bar.configure(value=0))
+
     def _duotone_threshold(self):
+        self.progress_bar["value"] = 0
+
         threshold = 210
         arr = np.array(self.current_image)
         rgb = arr[..., :3].astype(np.float32)
@@ -262,23 +350,30 @@ class App:
         arr[luma >= threshold, :3] = [255, 0, 0]
         self.current_image = Image.fromarray(arr)
 
+        self.progress_bar["value"] = 100
+        self.root.update_idletasks()
+        self.root.after(20, lambda: self.progress_bar.configure(value=0))
+
     def _negative(self):
         self.progress_bar["value"] = 0
         arr = np.array(self.current_image)
         arr[..., :3] = 255 - arr[..., :3] 
         self.current_image = Image.fromarray(arr)
+
         self.progress_bar["value"] = 100
         self.root.update_idletasks()
         self.root.after(20, lambda: self.progress_bar.configure(value=0))
 
     def _glow(self):
-        from PIL import ImageFilter
+        self.progress_bar["value"] = 0
+
         arr = np.array(self.current_image)
         blur = Image.fromarray(arr).filter(ImageFilter.GaussianBlur(radius=14))
         blur_arr = np.array(blur)
         strength = 0.3
         glow_arr = np.clip(arr.astype(np.int16) + blur_arr.astype(np.int16) * strength, 0, 255).astype(np.uint8)
         self.current_image = Image.fromarray(glow_arr)
+
         self.progress_bar["value"] = 100
         self.root.update_idletasks()
         self.root.after(800, lambda: self.progress_bar.configure(value=0))
@@ -286,11 +381,51 @@ class App:
     def _color_grain(self):
         _W, _H = self.current_image.size
         self.progress_bar["value"] = 0
+
         arr = np.array(self.current_image).astype(np.float32)
         grain = np.random.randint(0, 256, (_H, _W, 3), dtype=np.uint8).astype(np.float32)
         strength = 0.3
         arr[..., :3] = np.clip(arr[..., :3] * (1 - strength) + grain * strength, 0, 255)
         self.current_image = Image.fromarray(arr.astype(np.uint8))
+
+        self.progress_bar["value"] = 100
+        self.root.update_idletasks()
+        self.root.after(20, lambda: self.progress_bar.configure(value=0))
+
+    def _hue_shift(self):
+        self.progress_bar["value"] = 0
+        
+        arr = np.array(self.current_image.convert("RGB"))
+        hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV).astype(np.float32)
+        hsv[..., 0] = (hsv[..., 0] + 10) % 180
+        result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        self.current_image = Image.fromarray(result)
+
+        self.progress_bar["value"] = 100
+        self.root.update_idletasks()
+        self.root.after(20, lambda: self.progress_bar.configure(value=0))
+    
+    def _brightness_up(self):
+        self.progress_bar["value"] = 0
+
+        arr = np.array(self.current_image).astype(np.float32)
+        arr[..., :3] += 10
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        self.current_image = Image.fromarray(arr)
+        
+
+        self.progress_bar["value"] = 100
+        self.root.update_idletasks()
+        self.root.after(20, lambda: self.progress_bar.configure(value=0))
+
+    def _brightness_down(self):
+        self.progress_bar["value"] = 0
+
+        arr = np.array(self.current_image).astype(np.float32)
+        arr[..., :3] -= 10
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        self.current_image = Image.fromarray(arr)
+
         self.progress_bar["value"] = 100
         self.root.update_idletasks()
         self.root.after(20, lambda: self.progress_bar.configure(value=0))
