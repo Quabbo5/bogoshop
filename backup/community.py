@@ -141,10 +141,7 @@ class CommunityClient:
 
     def fetch_posts(self, limit: int = 40) -> list[dict]:
         try:
-            res = (self.sb.table("posts").select("*")
-                   .order("like_count", desc=True)
-                   .order("created_at", desc=True)
-                   .limit(limit).execute())
+            res = self.sb.table("posts").select("*").order("created_at", desc=True).limit(limit).execute()
             return res.data or []
         except Exception:
             return []
@@ -181,12 +178,7 @@ class CommunityClient:
             _req.post(f"{SUPABASE_URL}/rest/v1/likes",
                       json={"post_id": post_id, "user_id": uid},
                       headers={**sh, "Prefer": "return=minimal"})
-        stats = self.get_post_stats(post_id)
-        # Keep like_count in sync for popularity ordering
-        _req.patch(f"{SUPABASE_URL}/rest/v1/posts?id=eq.{post_id}",
-                   json={"like_count": stats["likes"]},
-                   headers={**sh, "Prefer": "return=minimal"})
-        return stats
+        return self.get_post_stats(post_id)
 
     # --- comments ---
 
@@ -215,76 +207,15 @@ class CommunityClient:
             raise RuntimeError(f"Comment failed: {r.status_code} {r.text}")
         return r.json()[0] if r.json() else {}
 
-    def vote_comment(self, comment_id: str, vote: int) -> bool:
-        """Cast a vote on a comment.  vote: 1 = upvote, -1 = downvote, 0 = remove vote.
-        Returns True if the DB was successfully updated."""
+    def upvote_comment(self, comment_id: str):
         import requests as _req
-        if not self.session:
-            raise RuntimeError("Not logged in")
-        uid = self.session.user.id
         sh = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
               "Content-Type": "application/json"}
-
-        # Check existing vote (comment_votes table may not exist yet — handled gracefully)
-        r = _req.get(f"{SUPABASE_URL}/rest/v1/comment_votes"
-                     f"?comment_id=eq.{comment_id}&user_id=eq.{uid}&select=vote", headers=sh)
-        existing = r.json()[0] if r.ok and r.json() else None
-        old_vote = existing["vote"] if existing else 0
-
-        if existing:
-            _req.delete(f"{SUPABASE_URL}/rest/v1/comment_votes"
-                        f"?comment_id=eq.{comment_id}&user_id=eq.{uid}", headers=sh)
-
-        # Fetch current counts — use select=* to avoid 400 if downvotes column is missing
-        r2 = _req.get(f"{SUPABASE_URL}/rest/v1/comments?id=eq.{comment_id}&select=*", headers=sh)
-        if not r2.ok or not r2.json():
-            return False
-
-        row = r2.json()[0]
-        patch = {}
-
-        ups = row.get("upvotes", 0)
-        if old_vote ==  1: ups = max(0, ups - 1)
-        if vote     ==  1: ups += 1
-        patch["upvotes"] = ups
-
-        # Only include downvotes if the column exists in the DB response
-        if "downvotes" in row:
-            downs = row.get("downvotes", 0)
-            if old_vote == -1: downs = max(0, downs - 1)
-            if vote     == -1: downs += 1
-            patch["downvotes"] = downs
-
-        rp = _req.patch(f"{SUPABASE_URL}/rest/v1/comments?id=eq.{comment_id}",
-                        json=patch, headers=sh)
-        if not rp.ok:
-            return False
-
-        # Track per-user vote (comment_votes table may not exist — non-fatal)
-        if vote != 0:
-            _req.post(f"{SUPABASE_URL}/rest/v1/comment_votes",
-                      json={"comment_id": comment_id, "user_id": uid, "vote": vote},
-                      headers={**sh, "Prefer": "return=minimal"})
-        return True
-
-    def get_user_comment_votes(self, post_id: str) -> dict:
-        """Returns {comment_id: vote} for the current user's votes on comments in a post."""
-        if not self.session:
-            return {}
-        import requests as _req
-        uid = self.session.user.id
-        sh = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
-        # Fetch comment ids for this post
-        r = _req.get(f"{SUPABASE_URL}/rest/v1/comments?post_id=eq.{post_id}&select=id", headers=sh)
-        if not r.ok or not r.json():
-            return {}
-        ids = ",".join(row["id"] for row in r.json())
-        # Fetch votes
-        r2 = _req.get(f"{SUPABASE_URL}/rest/v1/comment_votes"
-                      f"?comment_id=in.({ids})&user_id=eq.{uid}&select=comment_id,vote", headers=sh)
-        if not r2.ok:
-            return {}
-        return {row["comment_id"]: row["vote"] for row in r2.json()}
+        r = _req.get(f"{SUPABASE_URL}/rest/v1/comments?id=eq.{comment_id}&select=upvotes", headers=sh)
+        if r.ok and r.json():
+            new_val = r.json()[0]["upvotes"] + 1
+            _req.patch(f"{SUPABASE_URL}/rest/v1/comments?id=eq.{comment_id}",
+                       json={"upvotes": new_val}, headers=sh)
 
     def fetch_post_by_short_id(self, short_id: str) -> dict | None:
         try:
@@ -302,72 +233,3 @@ class CommunityClient:
             return res.data or []
         except Exception:
             return []
-
-    # --- profiles ---
-
-    def upload_avatar(self, image_pil) -> str | None:
-        """Crop + upload avatar image; return public URL or None on error."""
-        if not self.logged_in:
-            return None
-        import requests as _req
-        user_id = self.session.user.id
-        sh = {"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "apikey": SUPABASE_SERVICE_KEY}
-
-        img = image_pil.convert("RGB")
-        w, h = img.size
-        m = min(w, h)
-        img = img.crop(((w - m) // 2, (h - m) // 2, (w + m) // 2, (h + m) // 2)).resize((200, 200))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=88)
-
-        filename = f"avatars/{user_id}.jpg"
-        r = _req.post(f"{SUPABASE_URL}/storage/v1/object/{BUCKET}/{filename}",
-                      headers={**sh, "Content-Type": "image/jpeg", "x-upsert": "true"},
-                      data=buf.getvalue())
-        if r.status_code not in (200, 201):
-            return None
-        return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{filename}"
-
-    def upsert_profile(self, bio: str = None, avatar_url: str = None) -> str | None:
-        """Insert or update the current user's profile row."""
-        if not self.logged_in:
-            return "Not logged in."
-        import requests as _req
-        payload = {"user_id": self.session.user.id, "username": self.username}
-        if bio is not None:
-            payload["bio"] = bio
-        if avatar_url is not None:
-            payload["avatar_url"] = avatar_url
-        sh = {"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "apikey": SUPABASE_SERVICE_KEY,
-              "Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
-        r = _req.post(f"{SUPABASE_URL}/rest/v1/profiles", json=payload, headers=sh)
-        return None if r.ok else f"Profile save failed: {r.text}"
-
-    def fetch_profile(self, username: str) -> dict:
-        """Returns {bio, avatar_url} for any username. Empty dict on failure."""
-        import requests as _req
-        h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-        try:
-            r = _req.get(f"{SUPABASE_URL}/rest/v1/profiles"
-                         f"?username=eq.{username}&select=bio,avatar_url", headers=h)
-            if r.ok and r.json():
-                return r.json()[0]
-        except Exception:
-            pass
-        return {"bio": "", "avatar_url": ""}
-
-    def fetch_profiles_batch(self, usernames: list) -> dict:
-        """Returns {username: {bio, avatar_url}} for a list of usernames."""
-        if not usernames:
-            return {}
-        import requests as _req
-        h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-        names = ",".join(f'"{u}"' for u in usernames)
-        try:
-            r = _req.get(f"{SUPABASE_URL}/rest/v1/profiles"
-                         f"?username=in.({names})&select=username,bio,avatar_url", headers=h)
-            if r.ok and r.json():
-                return {row["username"]: row for row in r.json()}
-        except Exception:
-            pass
-        return {}
