@@ -1,5 +1,20 @@
 [
   {
+    "filename": "20260324_002126.jpg",
+    "date": "24 Mar 2026  00:21",
+    "effects": "Negative, Glow, Glow, Glow, Color Grain, Color Grain, Color Grain"
+  },
+  {
+    "filename": "20260324_001810.jpg",
+    "date": "24 Mar 2026  00:18",
+    "effects": "Negative, Color Grain, Brightness Up, Brightness Up, Brightness Down, Brightness Down, Brightness Down, Brightness Down, Brightness Down, Brightness Down, Glow, Glow, Negative, Negative, Hue shift, Hue shift"
+  },
+  {
+    "filename": "20260324_000749.jpg",
+    "date": "24 Mar 2026  00:07",
+    "effects": "Negative, RedThreshold, Glow, Glow, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift, Hue shift"
+  },
+  {
     "filename": "20260323_234820.jpg",
     "date": "23 Mar 2026  23:48",
     "effects": "\u2014"

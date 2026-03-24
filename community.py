@@ -95,6 +95,11 @@ class CommunityClient:
 
     # --- posts ---
 
+    @staticmethod
+    def make_short_id() -> int:
+        import random as _r
+        return _r.randint(100_000_000, 999_999_999)
+
     def upload_post(self, image_pil, title: str, effects: list[str], description: str = "") -> str | None:
         if not self.logged_in:
             return "Not logged in."
@@ -124,7 +129,8 @@ class CommunityClient:
                 headers={**auth_headers, "Content-Type": "application/json", "Prefer": "return=minimal"},
                 json={"user_id": user_id, "username": self.username,
                       "image_url": image_url, "title": title,
-                      "effects": ", ".join(effects), "description": description}
+                      "effects": ", ".join(effects), "description": description,
+                      "short_id": self.make_short_id()}
             )
             if r.status_code not in (200, 201):
                 return f"DB error: {r.text}"
@@ -139,6 +145,84 @@ class CommunityClient:
             return res.data or []
         except Exception:
             return []
+
+    # --- likes ---
+
+    def get_post_stats(self, post_id: str) -> dict:
+        """Returns {likes: N, has_liked: bool}."""
+        import requests as _req
+        h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        try:
+            r = _req.get(f"{SUPABASE_URL}/rest/v1/likes?post_id=eq.{post_id}&select=user_id", headers=h)
+            rows = r.json() if r.ok else []
+            count = len(rows)
+            uid = self.session.user.id if self.session else None
+            has_liked = any(row["user_id"] == uid for row in rows)
+            return {"likes": count, "has_liked": has_liked}
+        except Exception:
+            return {"likes": 0, "has_liked": False}
+
+    def toggle_like(self, post_id: str) -> dict:
+        if not self.session:
+            raise RuntimeError("Not logged in")
+        import requests as _req
+        uid = self.session.user.id
+        sh = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+              "Content-Type": "application/json"}
+        # check existing
+        r = _req.get(f"{SUPABASE_URL}/rest/v1/likes?post_id=eq.{post_id}&user_id=eq.{uid}&select=id",
+                     headers=sh)
+        if r.ok and r.json():
+            _req.delete(f"{SUPABASE_URL}/rest/v1/likes?post_id=eq.{post_id}&user_id=eq.{uid}", headers=sh)
+        else:
+            _req.post(f"{SUPABASE_URL}/rest/v1/likes",
+                      json={"post_id": post_id, "user_id": uid},
+                      headers={**sh, "Prefer": "return=minimal"})
+        return self.get_post_stats(post_id)
+
+    # --- comments ---
+
+    def get_comments(self, post_id: str) -> list:
+        import requests as _req
+        h = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        try:
+            r = _req.get(f"{SUPABASE_URL}/rest/v1/comments?post_id=eq.{post_id}"
+                         f"&order=created_at.asc&select=*", headers=h)
+            return r.json() if r.ok else []
+        except Exception:
+            return []
+
+    def add_comment(self, post_id: str, content: str, parent_id: str | None = None) -> dict:
+        if not self.session:
+            raise RuntimeError("Not logged in")
+        import requests as _req
+        sh = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+              "Content-Type": "application/json", "Prefer": "return=representation"}
+        payload = {"post_id": post_id, "user_id": self.session.user.id,
+                   "username": self.username or "?", "content": content}
+        if parent_id:
+            payload["parent_id"] = parent_id
+        r = _req.post(f"{SUPABASE_URL}/rest/v1/comments", json=payload, headers=sh)
+        if not r.ok:
+            raise RuntimeError(f"Comment failed: {r.status_code} {r.text}")
+        return r.json()[0] if r.json() else {}
+
+    def upvote_comment(self, comment_id: str):
+        import requests as _req
+        sh = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+              "Content-Type": "application/json"}
+        r = _req.get(f"{SUPABASE_URL}/rest/v1/comments?id=eq.{comment_id}&select=upvotes", headers=sh)
+        if r.ok and r.json():
+            new_val = r.json()[0]["upvotes"] + 1
+            _req.patch(f"{SUPABASE_URL}/rest/v1/comments?id=eq.{comment_id}",
+                       json={"upvotes": new_val}, headers=sh)
+
+    def fetch_post_by_short_id(self, short_id: str) -> dict | None:
+        try:
+            res = self.sb.table("posts").select("*").eq("short_id", int(short_id)).execute()
+            return res.data[0] if res.data else None
+        except Exception:
+            return None
 
     def fetch_user_posts(self, username: str, limit: int = 100) -> list[dict]:
         try:

@@ -12,7 +12,6 @@ import os
 import json
 import xml.etree.ElementTree as ET
 import re
-import random as _random
 from community import CommunityClient
 
 class App:
@@ -47,6 +46,9 @@ class App:
         self.help_menu.add_command(label="Open Documentation")
 
         self.current_image = None
+        self._original_image = None  # last freshly-loaded image (pre-effects)
+        self._nav_stack   = []       # browser-style back history
+        self._current_view = None    # callable that rebuilds the current panel
 
         # build command box (packed first so it anchors to bottom)
         self.cmd_box = Frame(self.root, bg="#141414", height=175)
@@ -217,12 +219,16 @@ class App:
         args = parts[1:]
 
         if cmd == "/r":
-            self.current_image = self._resize("img/jpegs/gloomerald.jpg")
-            new_img = self.current_image.resize((800, 800))
-            new_canvas = ImageTk.PhotoImage(new_img)
-            self.image_label.config(image=new_canvas)
-            self.image_label.image = new_canvas
-            self._log("Image reset to original.", "ok")
+            if self._original_image is None:
+                self._log("No image loaded yet.", "err")
+                return
+            self.current_image = self._original_image.copy()
+            self._applied_effects.clear()
+            preview = self.current_image.resize((800, 800))
+            tk_img = ImageTk.PhotoImage(preview)
+            self.image_label.config(image=tk_img)
+            self.image_label.image = tk_img
+            self._log("Reset to original.", "ok")
 
         elif cmd == "/clear":
             self.log_text.config(state=NORMAL)
@@ -369,6 +375,22 @@ class App:
 
         canvas.bind("<Configure>", _on_canvas_resize, add="+")
 
+    # --- navigation history ---
+
+    def _nav_push(self):
+        """Push current view onto the back-stack before navigating away."""
+        if self._current_view is not None:
+            self._nav_stack.append(self._current_view)
+
+    def _nav_back(self):
+        """Go back to the previous panel, or community if history is empty."""
+        if self._nav_stack:
+            self._current_view = None       # prevent re-push inside the popped fn
+            fn = self._nav_stack.pop()
+            fn()
+        else:
+            self._show_community_panel()
+
     # --- label button (macOS-safe colored button) ---
 
     def _btn(self, parent, text, command, bg="#111111", fg="#f5f5f5",
@@ -382,6 +404,15 @@ class App:
         lbl.bind("<ButtonPress-1>", lambda _: lbl.config(bg="#333333"))
         lbl.bind("<ButtonRelease-1>", lambda _: (lbl.config(bg=hover), command()))
         return lbl
+
+    def _bind_scroll(self, canvas):
+        """Attach trackpad + arrow key scrolling to a Canvas (macOS-safe)."""
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta), "units"))
+        canvas.bind("<Up>",    lambda _: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Down>",  lambda _: canvas.yview_scroll( 1, "units"))
+        canvas.bind("<Prior>", lambda _: canvas.yview_scroll(-5, "units"))
+        canvas.bind("<Next>",  lambda _: canvas.yview_scroll( 5, "units"))
+        canvas.focus_set()
 
     # --- logging ---
 
@@ -422,26 +453,99 @@ class App:
         self._applied_effects.append(effect["name"])
         self._log(f"[{effect['id']}] {effect['name']} – done.", "ok")
     
-    def _insert_with_bold_italic(self, widget, line, tag):
-        parts = line.split("**")
+    def _insert_inline(self, widget, text, tag):
+        """Insert text with **bold** and *italic* inline, no trailing newline."""
+        parts = text.split("**")
         for i, part in enumerate(parts):
             if i % 2 == 1:
                 widget.insert(END, part, "bold")
             else:
-                italic_parts = part.split("*")
-                for j, ipart in enumerate(italic_parts):
-                    if j % 2 == 1:
-                        widget.insert(END, ipart, "italic")
-                    else:
-                        widget.insert(END, ipart, tag)
+                for j, ipart in enumerate(part.split("*")):
+                    widget.insert(END, ipart, "italic" if j % 2 == 1 else tag)
+
+    def _insert_with_bold_italic(self, widget, line, tag):
+        self._insert_inline(widget, line, tag)
         widget.insert(END, "\n")
+
+    _REF_RE = re.compile(r'<([^>]+)>')
+
+    def _inline_text(self, parent, content: str, bg: str, fg: str = "#dddddd",
+                     font: str = "Plus_Jakarta_Sans 10"):
+        """Read-only Text widget that renders <ref> and @user links clickable inline."""
+        t = Text(parent, bg=bg, fg=fg, font=font, relief=FLAT, bd=0,
+                 highlightthickness=0, wrap=WORD, cursor="arrow")
+        t.tag_config("normal", foreground=fg, font=font)
+        _idx = [0]
+
+        # split on both @user and <ref> patterns
+        _COMBINED = re.compile(r'(@\w+)|<([^>]+)>')
+        pos = 0
+        for m in _COMBINED.finditer(content):
+            # plain text before match
+            if m.start() > pos:
+                t.insert(END, content[pos:m.start()], "normal")
+            tname = f"_ir_{_idx[0]}"; _idx[0] += 1
+            if m.group(1):                          # @username
+                uname = m.group(1)[1:]
+                t.tag_config(tname, foreground="#9A9AFF", font=font)
+                t.insert(END, m.group(1), tname)
+                t.tag_bind(tname, "<Button-1>", lambda _, u=uname: self._open_user_profile(u))
+            else:                                   # <ref>
+                ref = m.group(2)
+                t.tag_config(tname, foreground="#7EC8A4", underline=True, font=font)
+                t.insert(END, m.group(0), tname)
+                if ref.endswith(".md"):
+                    t.tag_bind(tname, "<Button-1>", lambda _, r=ref: self._open_wiki_by_file(r))
+                elif ref.isdigit():
+                    t.tag_bind(tname, "<Button-1>", lambda _, r=ref: self._open_post_by_short_id(r))
+            t.tag_bind(tname, "<Enter>", lambda _: t.config(cursor="hand2"))
+            t.tag_bind(tname, "<Leave>", lambda _: t.config(cursor="arrow"))
+            pos = m.end()
+        if pos < len(content):
+            t.insert(END, content[pos:], "normal")
+
+        t.config(state=DISABLED)
+        t.update_idletasks()
+        lines = max(int(t.index(END).split(".")[0]) - 1, 1)
+        t.config(height=lines)
+        return t
 
     def _render_markdown(self, widget, text):
         widget.config(state=NORMAL)
         widget.delete("1.0", END)
 
-        in_code_block = False
+        widget.tag_config("h1",     font="Plus_Jakarta_Sans 18 bold", foreground="#f5f5f5")
+        widget.tag_config("h2",     font="Plus_Jakarta_Sans 14 bold", foreground="#c0c0c0")
+        widget.tag_config("bold",   font="Plus_Jakarta_Sans 11 bold", foreground="#B5AFED")
+        widget.tag_config("italic", font="Plus_Jakarta_Sans 11 italic", foreground="#6C65AA")
+        widget.tag_config("normal", font="Plus_Jakarta_Sans 11",      foreground="#f5f5f5")
+        widget.tag_config("code",   font=("Source Code Pro", 11),     foreground="#dbe9ff")
 
+        _link_idx = [0]
+
+        def _insert_line(raw_line, base_tag):
+            """Insert a line, turning <ref.md> and <123456789> into clickable links."""
+            segments = self._REF_RE.split(raw_line)
+            for k, seg in enumerate(segments):
+                if k % 2 == 1:          # matched group — a reference
+                    ref = seg
+                    tname = f"_ref_{_link_idx[0]}"; _link_idx[0] += 1
+                    widget.tag_config(tname, foreground="#7EC8A4", underline=True,
+                                      font="Plus_Jakarta_Sans 11")
+                    widget.insert(END, f"<{ref}>", tname)
+                    if ref.endswith(".md"):
+                        widget.tag_bind(tname, "<Button-1>",
+                                        lambda _, r=ref: self._open_wiki_by_file(r))
+                    elif ref.isdigit():
+                        widget.tag_bind(tname, "<Button-1>",
+                                        lambda _, r=ref: self._open_post_by_short_id(r))
+                    widget.tag_bind(tname, "<Enter>", lambda _: widget.config(cursor="hand2"))
+                    widget.tag_bind(tname, "<Leave>", lambda _: widget.config(cursor=""))
+                else:
+                    self._insert_inline(widget, seg, base_tag)
+            widget.insert(END, "\n")
+
+        in_code_block = False
         for line in text.split("\n"):
             if line.startswith("```"):
                 in_code_block = not in_code_block
@@ -450,35 +554,32 @@ class App:
                 widget.insert(END, line + "\n", "code")
                 continue
             if line.startswith("# "):
-                self._insert_with_bold_italic(widget, line[2:], "h1")
+                _insert_line(line[2:], "h1")
             elif line.startswith("## "):
-                self._insert_with_bold_italic(widget, line[3:], "h2")
+                _insert_line(line[3:], "h2")
             elif line.startswith("- "):
-                self._insert_with_bold_italic(widget, "• " + line[2:], "normal")
-            elif line.startswith("```"):
-                pass
+                _insert_line("• " + line[2:], "normal")
             else:
-                self._insert_with_bold_italic(widget, line, "normal")
-        widget.tag_config("h1", font="Plus_Jakarta_Sans 18 bold", foreground="#f5f5f5")
-        widget.tag_config("h2", font="Plus_Jakarta_Sans 14 bold", foreground="#c0c0c0")
-        widget.tag_config("bold", font="Plus_Jakarta_Sans 11 bold", foreground="#B5AFED")
-        widget.tag_config("italic", font="Plus_Jakarta_Sans 11 italic", foreground="#6C65AA")
-        widget.tag_config("normal", font="Plus_Jakarta_Sans 11", foreground="#f5f5f5")
-        widget.tag_config("code", font=("Source Code Pro", 11), foreground="#dbe9ff")
+                _insert_line(line, "normal")
+
         widget.config(state=DISABLED)
 
     def _show_wiki_inline(self, index):
         effect = self.EFFECTS[index]
         file_path = effect.get("preview", "img/jpegs/cat.jpg")
-
+        self._nav_push()
+        self._current_view = lambda: self._show_wiki_inline(index)
         for widget in self.wiki_view.winfo_children():
             widget.destroy()
 
-        # title block — exact styles from _load_wiki
-        Label(self.wiki_view, justify=LEFT, padx=0, pady=0, anchor=None,
-              text=effect["name"], fg="#f5f5f5", bg="#221F3A",
-              font="Helvetica 24 bold", height=2
-             ).pack(side=TOP, anchor="nw", fill=X)
+        # banner with back button
+        hdr = Frame(self.wiki_view, bg="#221F3A")
+        hdr.pack(fill=X)
+        self._btn(hdr, "← Back", self._nav_back,
+                  bg="#221F3A", fg="#888888",
+                  font="Plus_Jakarta_Sans 9", padx=12, pady=8).pack(side=LEFT)
+        Label(hdr, text=effect["name"], fg="#f5f5f5", bg="#221F3A",
+              font="Plus_Jakarta_Sans 14 bold", padx=8).pack(side=LEFT)
 
         Label(self.wiki_view, justify=LEFT, padx=0, pady=0, anchor=None,
               text=f"ID: #{effect['id']}", fg="#c0c0c0", bg="#424242",
@@ -785,6 +886,7 @@ class App:
         if not path:
             return
         self.current_image = self._resize(path)
+        self._original_image = self.current_image.copy()
         self._applied_effects.clear()
         new_img = self.current_image.resize((800, 800))
         new_canvas = ImageTk.PhotoImage(new_img)
@@ -793,20 +895,32 @@ class App:
         self._log(f"Imported: {path.split('/')[-1]}", "ok")
 
     def _import_random(self):
-        import glob
-        choices = glob.glob("img/jpegs/*.jpg") + glob.glob("img/jpegs/*.jpeg")
-        if not choices:
-            self._log("No images found in img/jpegs/.", "err")
-            return
-        path = _random.choice(choices)
-        self.current_image = self._resize(path)
-        new_img = self.current_image.resize((800, 800))
-        new_canvas = ImageTk.PhotoImage(new_img)
-        self.image_label.config(image=new_canvas)
-        self.image_label.image = new_canvas
-        if self._wiki_open:
-            self._close_wiki_inline()
-        self._log(f"Random: {path.split('/')[-1]}", "ok")
+        import threading, urllib.request, io as _io
+        self._log("Fetching random image…", "info")
+
+        def _fetch():
+            try:
+                url = "https://picsum.photos/1600/1600"
+                req = urllib.request.Request(url, headers={"User-Agent": "Bogoshop/1.0"})
+                with urllib.request.urlopen(req, timeout=12) as r:
+                    data = r.read()
+                img = Image.open(_io.BytesIO(data)).convert("RGBA")
+                self.current_image = img
+                self._original_image = img.copy()
+                self._applied_effects.clear()
+                preview = img.resize((800, 800))
+                tk_img = ImageTk.PhotoImage(preview)
+                def _update():
+                    self.image_label.config(image=tk_img)
+                    self.image_label.image = tk_img
+                    if self._wiki_open:
+                        self._close_wiki_inline()
+                    self._log("Random image loaded from Picsum.", "ok")
+                self.root.after(0, _update)
+            except Exception as e:
+                self.root.after(0, lambda: self._log(f"Picsum error: {e}", "err"))
+
+        threading.Thread(target=_fetch, daemon=True).start()
 
     def _save_image(self):
         path = filedialog.asksaveasfilename(defaultextension=".png",
@@ -819,6 +933,7 @@ class App:
     # --- community ---
 
     def _open_community(self):
+        self._nav_stack.clear()
         if not self.community.logged_in:
             self._auth_dialog()
         else:
@@ -911,6 +1026,8 @@ class App:
         self.root.bind("<Escape>", self._close_wiki_inline)
 
     def _show_community_panel(self):
+        self._nav_push()
+        self._current_view = lambda: self._show_community_panel()
         for widget in self.wiki_view.winfo_children():
             widget.destroy()
 
@@ -942,6 +1059,7 @@ class App:
             canvas.itemconfig(canvas_window, width=e.width)
         canvas.bind("<Configure>", _on_resize)
         gallery.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._bind_scroll(canvas)
 
         self._load_gallery(canvas, gallery)
 
@@ -981,7 +1099,8 @@ class App:
 
     def _open_post_view(self, post: dict, img_lbl):
         import threading, urllib.request
-
+        self._nav_push()
+        self._current_view = lambda: self._open_post_view(post, img_lbl)
         for w in self.wiki_view.winfo_children():
             w.destroy()
 
@@ -1005,17 +1124,12 @@ class App:
         canvas.bind("<Configure>", _on_canvas_resize)
         content.bind("<Configure>", lambda _: canvas.configure(
             scrollregion=canvas.bbox("all")))
-
-        canvas.bind("<Up>",    lambda _: canvas.yview_scroll(-1, "units"))
-        canvas.bind("<Down>",  lambda _: canvas.yview_scroll( 1, "units"))
-        canvas.bind("<Prior>", lambda _: canvas.yview_scroll(-5, "units"))
-        canvas.bind("<Next>",  lambda _: canvas.yview_scroll( 5, "units"))
-        canvas.focus_set()
+        self._bind_scroll(canvas)
 
         # ── banner header ─────────────────────────────────────────────────
         hdr = Frame(content, bg="#221F3A")
         hdr.pack(fill=X)
-        self._btn(hdr, "← Back", self._show_community_panel,
+        self._btn(hdr, "← Back", self._nav_back,
                   bg="#221F3A", fg="#888888",
                   font="Plus_Jakarta_Sans 9", padx=12, pady=8
                   ).pack(side=LEFT)
@@ -1026,9 +1140,13 @@ class App:
         Frame(content, bg="#333333", height=1).pack(fill=X)
         meta_row = Frame(content, bg="#2A2A2A")
         meta_row.pack(fill=X)
-        Label(meta_row, text="by ", font="Plus_Jakarta_Sans 8 italic",
-              bg="#2A2A2A", fg="#888888", padx=12, pady=4).pack(side=LEFT)
+
+        # left: by <username> (clickable → profile, right-click → copy)
         _uname = post.get("username", "?")
+        by_lbl = Label(meta_row, text="by ",
+                       font="Plus_Jakarta_Sans 8 italic",
+                       bg="#2A2A2A", fg="#888888", padx=12, pady=4)
+        by_lbl.pack(side=LEFT)
         uname_lbl = Label(meta_row, text=_uname,
                           font="Plus_Jakarta_Sans 8 italic bold",
                           bg="#2A2A2A", fg="#aaaaaa", pady=4, cursor="hand2")
@@ -1036,9 +1154,33 @@ class App:
         uname_lbl.bind("<Enter>", lambda _: uname_lbl.config(fg="#f5f5f5"))
         uname_lbl.bind("<Leave>", lambda _: uname_lbl.config(fg="#aaaaaa"))
         uname_lbl.bind("<Button-1>", lambda _, u=_uname: self._open_user_profile(u))
-        Label(meta_row, text=f"   ·   {post.get('effects', '')}",
-              font="Plus_Jakarta_Sans 8 italic", bg="#2A2A2A", fg="#888888",
-              pady=4).pack(side=LEFT)
+        uname_lbl.bind("<Button-2>", lambda _, u=_uname: (
+            self.root.clipboard_clear(), self.root.clipboard_append(u),
+            uname_lbl.config(fg="#7EC8A4"),
+            uname_lbl.after(1200, lambda: uname_lbl.config(fg="#aaaaaa"))
+        ))
+
+        # right: Post ID: <number> (click to copy)
+        _sid = str(post.get("short_id", ""))
+        if _sid:
+            id_frame = Frame(meta_row, bg="#2A2A2A")
+            id_frame.pack(side=RIGHT, padx=8)
+            Label(id_frame, text="Post ID: ",
+                  font="Plus_Jakarta_Sans 8", bg="#2A2A2A", fg="#555555",
+                  pady=4).pack(side=LEFT)
+            sid_lbl = Label(id_frame, text=f"<{_sid}>",
+                            font="Plus_Jakarta_Sans 8 bold", bg="#2A2A2A", fg="#555555",
+                            cursor="hand2", pady=4)
+            sid_lbl.pack(side=LEFT)
+            def _copy_id(s=_sid):
+                self.root.clipboard_clear()
+                self.root.clipboard_append(f"<{s}>")
+                sid_lbl.config(fg="#7EC8A4")
+                sid_lbl.after(1200, lambda: sid_lbl.config(fg="#555555"))
+            sid_lbl.bind("<Button-1>", lambda _: _copy_id())
+            sid_lbl.bind("<Enter>", lambda _: sid_lbl.config(fg="#aaaaaa"))
+            sid_lbl.bind("<Leave>", lambda _: sid_lbl.config(fg="#555555"))
+
         Frame(content, bg="#333333", height=1).pack(fill=X)
 
         # ── image ─────────────────────────────────────────────────────────
@@ -1085,6 +1227,7 @@ class App:
                     with urllib.request.urlopen(post["image_url"], timeout=10) as r:
                         raw = r.read()
                 self.current_image = Image.open(io.BytesIO(raw)).convert("RGBA")
+                self._original_image = self.current_image.copy()
                 self._applied_effects.clear()
                 new_img = self.current_image.resize((800, 800))
                 tk_img  = ImageTk.PhotoImage(new_img)
@@ -1117,24 +1260,229 @@ class App:
         self._btn(btn_row, "Import to editor", _import).pack(side=LEFT, padx=(0, 8))
         self._btn(btn_row, "Download", _download).pack(side=LEFT)
 
-        # ── reactions + comments placeholder ─────────────────────────────
-        Frame(content, bg="#2A2A2A", height=1).pack(fill=X, padx=16)
+        # ── likes + comments ──────────────────────────────────────────────
+        post_id = post.get("id", "")
 
-        reactions = Frame(content, bg=BG)
-        reactions.pack(fill=X, padx=16, pady=10)
-        for icon, ltext in [("♥", "Like"), ("↩", "Reply")]:
-            self._btn(reactions, f"{icon}  {ltext}", lambda: None,
-                      font="Plus_Jakarta_Sans 9", padx=12, pady=5
-                      ).pack(side=LEFT, padx=(0, 6))
+        def _time_ago(ts):
+            import datetime
+            try:
+                t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                d = int((datetime.datetime.now(datetime.timezone.utc) - t).total_seconds())
+                if d < 60:    return "just now"
+                if d < 3600:  return f"{d//60}m ago"
+                if d < 86400: return f"{d//3600}h ago"
+                return f"{d//86400}d ago"
+            except Exception:
+                return ""
 
-        Frame(content, bg="#2A2A2A", height=1).pack(fill=X, padx=16)
+        # like bar
+        Frame(content, bg="#2A2A2A", height=1).pack(fill=X)
+        like_row = Frame(content, bg=BG)
+        like_row.pack(fill=X, padx=16, pady=8)
 
-        Label(content, text="Comments",
-              font="Plus_Jakarta_Sans 10 bold", bg=BG, fg="#555555",
-              anchor="w", padx=16).pack(fill=X, pady=(10, 2))
-        Label(content, text="Comments aren't available yet.",
-              font="Plus_Jakarta_Sans 9 italic", bg=BG, fg="#333333",
-              anchor="w", padx=16).pack(fill=X, pady=(0, 24))
+        _like_state = {"count": 0, "liked": False}
+
+        def _refresh_like():
+            h = "♥" if _like_state["liked"] else "♡"
+            like_lbl.config(text=f"{h}  {_like_state['count']}  {'Liked' if _like_state['liked'] else 'Like'}")
+
+        def _toggle_like():
+            if not self.community.session:
+                self._log("Log in to like posts.", "err"); return
+            def _do():
+                try:
+                    s = self.community.toggle_like(post_id)
+                    _like_state["count"] = s["likes"]
+                    _like_state["liked"] = s["has_liked"]
+                    try: like_row.after(0, _refresh_like)
+                    except Exception: pass
+                except Exception as e:
+                    self._log(str(e), "err")
+            threading.Thread(target=_do, daemon=True).start()
+
+        like_lbl = self._btn(like_row, "♡  0  Like", _toggle_like,
+                             font="Plus_Jakarta_Sans 9", padx=12, pady=5)
+        like_lbl.pack(side=LEFT)
+
+        def _load_stats():
+            s = self.community.get_post_stats(post_id)
+            _like_state["count"] = s["likes"]
+            _like_state["liked"] = s["has_liked"]
+            try: like_row.after(0, _refresh_like)
+            except Exception: pass
+        threading.Thread(target=_load_stats, daemon=True).start()
+
+        # comments header
+        Frame(content, bg="#2A2A2A", height=1).pack(fill=X)
+        chdr = Frame(content, bg=BG)
+        chdr.pack(fill=X, padx=16, pady=(10, 4))
+        comments_lbl = Label(chdr, text="Comments",
+                             font="Plus_Jakarta_Sans 10 bold", bg=BG, fg="#f5f5f5")
+        comments_lbl.pack(side=LEFT)
+        Frame(content, bg="#2A2A2A", height=1).pack(fill=X)
+
+        # comment input (logged-in only)
+        if self.community.session:
+            inp_row = Frame(content, bg=BG)
+            inp_row.pack(fill=X, padx=16, pady=8)
+            PLACEHOLDER = "Write a comment…"
+            c_entry = Entry(inp_row, bg="#2D2D2D", fg="#555555",
+                            insertbackground="#f5f5f5",
+                            font="Plus_Jakarta_Sans 10", relief=FLAT,
+                            highlightthickness=1, highlightbackground="#444444",
+                            highlightcolor="#6C6C9A")
+            c_entry.insert(0, PLACEHOLDER)
+            c_entry.pack(side=LEFT, fill=X, expand=1, ipady=6, padx=(0, 8))
+            c_entry.bind("<FocusIn>",  lambda _: (c_entry.delete(0, END), c_entry.config(fg="#f5f5f5"))
+                         if c_entry.get() == PLACEHOLDER else None)
+            c_entry.bind("<FocusOut>", lambda _: (c_entry.insert(0, PLACEHOLDER), c_entry.config(fg="#555555"))
+                         if not c_entry.get().strip() else None)
+
+            def _submit_top(pid=None):
+                txt = c_entry.get().strip()
+                if not txt or txt == PLACEHOLDER: return
+                try:
+                    self.community.add_comment(post_id, txt, pid)
+                    c_entry.delete(0, END)
+                    c_entry.config(fg="#555555"); c_entry.insert(0, PLACEHOLDER)
+                    _reload_comments()
+                except Exception as e:
+                    self._log(str(e), "err")
+
+            c_entry.bind("<Return>", lambda _: _submit_top())
+            self._btn(inp_row, "Post", _submit_top,
+                      font="Plus_Jakarta_Sans 9", padx=12, pady=5).pack(side=LEFT)
+
+        # comments list
+        comments_frame = Frame(content, bg=BG)
+        comments_frame.pack(fill=X, padx=16, pady=(4, 24))
+
+        def _render_comment(parent, c, replies_map, depth=0):
+            INDENT, CBORDER = 20, "#3A3A5A" if depth == 0 else "#2A2A3A"
+            block = Frame(parent, bg="#1E1E2E")
+            block.pack(fill=X, pady=(0, 5), padx=(depth * INDENT, 0))
+            Frame(block, bg=CBORDER, width=3).pack(side=LEFT, fill=Y)
+            inner = Frame(block, bg="#1E1E2E")
+            inner.pack(side=LEFT, fill=X, expand=1, padx=8, pady=6)
+
+            # header
+            hr = Frame(inner, bg="#1E1E2E")
+            hr.pack(fill=X)
+            unl = Label(hr, text=c.get("username", "?"),
+                        font="Plus_Jakarta_Sans 9 bold", bg="#1E1E2E", fg="#9A9AFF",
+                        cursor="hand2")
+            unl.pack(side=LEFT)
+            unl.bind("<Enter>", lambda _: unl.config(fg="#ccccff"))
+            unl.bind("<Leave>", lambda _: unl.config(fg="#9A9AFF"))
+            unl.bind("<Button-1>", lambda _, u=c.get("username","?"): self._open_user_profile(u))
+            Label(hr, text=f"  ·  {_time_ago(c.get('created_at',''))}",
+                  font="Plus_Jakarta_Sans 8", bg="#1E1E2E", fg="#555555").pack(side=LEFT)
+            Label(hr, text=f"↑ {c.get('upvotes', 0)}",
+                  font="Plus_Jakarta_Sans 8 bold", bg="#1E1E2E", fg="#7EC8A4").pack(side=RIGHT)
+
+            # body
+            self._inline_text(inner, c.get("content", ""),
+                              bg="#1E1E2E", fg="#dddddd",
+                              font="Plus_Jakarta_Sans 10").pack(fill=X, pady=(2, 4))
+
+            # actions
+            act = Frame(inner, bg="#1E1E2E")
+            act.pack(fill=X)
+
+            def _upvote(cid=c["id"]):
+                def _do():
+                    self.community.upvote_comment(cid)
+                    try: comments_frame.after(0, _reload_comments)
+                    except Exception: pass
+                threading.Thread(target=_do, daemon=True).start()
+
+            for txt, clr, cmd in [("↑ upvote", "#555555", _upvote)]:
+                al = Label(act, text=txt, font="Plus_Jakarta_Sans 8",
+                           bg="#1E1E2E", fg=clr, cursor="hand2")
+                al.pack(side=LEFT, padx=(0, 8))
+                al.bind("<Button-1>", lambda _, fn=cmd: fn())
+                al.bind("<Enter>", lambda _, w=al: w.config(fg="#7EC8A4"))
+                al.bind("<Leave>", lambda _, w=al, c2=clr: w.config(fg=c2))
+
+            if self.community.session and depth < 2:
+                rl = Label(act, text="reply", font="Plus_Jakarta_Sans 8",
+                           bg="#1E1E2E", fg="#555555", cursor="hand2")
+                rl.pack(side=LEFT)
+                rl.bind("<Enter>", lambda _: rl.config(fg="#9A9AFF"))
+                rl.bind("<Leave>", lambda _: rl.config(fg="#555555"))
+
+                _reply_box_ref = [None]
+
+                def _toggle_reply(cid=c["id"]):
+                    if _reply_box_ref[0] and _reply_box_ref[0].winfo_exists():
+                        _reply_box_ref[0].destroy(); _reply_box_ref[0] = None; return
+                    rb = Frame(inner, bg="#1E1E2E")
+                    rb.pack(fill=X, pady=(2, 2))
+                    _reply_box_ref[0] = rb
+                    rv = Entry(rb, bg="#252535", fg="#f5f5f5",
+                               insertbackground="#f5f5f5",
+                               font="Plus_Jakarta_Sans 9", relief=FLAT,
+                               highlightthickness=1, highlightbackground="#444444")
+                    rv.pack(side=LEFT, fill=X, expand=1, ipady=5)
+
+                    def _post_reply(cid=cid):
+                        txt = rv.get().strip()
+                        if not txt: return
+                        try:
+                            self.community.add_comment(post_id, txt, cid)
+                            rb.destroy(); _reply_box_ref[0] = None
+                            _reload_comments()
+                        except Exception as e:
+                            self._log(str(e), "err")
+
+                    rv.bind("<Return>", lambda _: _post_reply())
+                    self._btn(rb, "Reply", _post_reply,
+                              font="Plus_Jakarta_Sans 8", padx=8, pady=4
+                              ).pack(side=LEFT, padx=(4, 0))
+                    rv.focus_set()
+
+                rl.bind("<Button-1>", lambda _: _toggle_reply())
+
+            # render replies
+            for rep in replies_map.get(c["id"], []):
+                _render_comment(parent, rep, replies_map, depth + 1)
+
+        def _render_all(comments):
+            for w in comments_frame.winfo_children():
+                w.destroy()
+            roots = [c for c in comments if not c.get("parent_id")]
+            rmap  = {}
+            for c in comments:
+                if c.get("parent_id"):
+                    rmap.setdefault(c["parent_id"], []).append(c)
+            comments_lbl.config(text=f"Comments  ({len(comments)})")
+            if not roots:
+                Label(comments_frame, text="No comments yet. Be the first!",
+                      font="Plus_Jakarta_Sans 9 italic", bg=BG, fg="#444444",
+                      anchor="w").pack(fill=X, pady=8)
+                return
+            for c in roots:
+                _render_comment(comments_frame, c, rmap)
+
+        def _reload_comments():
+            def _fetch():
+                cs = self.community.get_comments(post_id)
+                try: comments_frame.after(0, lambda: _render_all(cs))
+                except Exception: pass
+            threading.Thread(target=_fetch, daemon=True).start()
+
+        _reload_comments()
+
+        # ── effects footer ────────────────────────────────────────────────
+        _fx = post.get("effects", "").strip()
+        if _fx:
+            Frame(content, bg="#222222", height=1).pack(fill=X, pady=(16, 0))
+            Label(content, text="Effects applied:",
+                  font="Plus_Jakarta_Sans 8 italic", bg="#1A1A1A", fg="#444444",
+                  anchor="w", padx=16).pack(fill=X, pady=(6, 2))
+            Label(content, text=_fx,
+                  font="Plus_Jakarta_Sans 8 italic", bg="#1A1A1A", fg="#3A3A3A",
+                  anchor="w", padx=16, justify=LEFT, wraplength=580).pack(fill=X, pady=(0, 20))
 
         self._wiki_open = True
         self.wiki_view.lift()
@@ -1144,64 +1492,87 @@ class App:
         if self.current_image is None:
             self._log("Load an image first before uploading.", "err")
             return
+        self._nav_push()
+        self._current_view = lambda: self._upload_post()
 
         for w in self.wiki_view.winfo_children():
             w.destroy()
 
-        BG = "#1A1A1A"
+        BG   = "#1A1A1A"
+        CARD = "#242424"
 
         # ── banner ────────────────────────────────────────────────────────
         hdr = Frame(self.wiki_view, bg="#221F3A")
         hdr.pack(fill=X)
-        self._btn(hdr, "← Back", self._show_community_panel,
+        self._btn(hdr, "← Back", self._nav_back,
                   bg="#221F3A", fg="#888888",
                   font="Plus_Jakarta_Sans 9", padx=12, pady=8
                   ).pack(side=LEFT)
         Label(hdr, text="Upload to Community",
               font="Plus_Jakarta_Sans 14 bold", bg="#221F3A", fg="#f5f5f5",
               padx=8).pack(side=LEFT)
-
         Frame(self.wiki_view, bg="#333333", height=1).pack(fill=X)
 
-        # ── form ──────────────────────────────────────────────────────────
-        form = Frame(self.wiki_view, bg=BG)
-        form.pack(fill=X, padx=30, pady=20)
+        # ── scrollable body ───────────────────────────────────────────────
+        outer = Frame(self.wiki_view, bg=BG)
+        outer.pack(fill=BOTH, expand=1)
+        canvas = Canvas(outer, bg=BG, highlightthickness=0, bd=0)
+        sb = Scrollbar(outer, orient=VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side=RIGHT, fill=Y)
+        canvas.pack(side=LEFT, fill=BOTH, expand=1)
+        body = Frame(canvas, bg=BG)
+        _cw = canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(_cw, width=e.width))
+        body.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
+        self._bind_scroll(canvas)
 
-        _lbl = dict(bg=BG, fg="#f5f5f5", font="Plus_Jakarta_Sans 10", anchor="w")
-        _ent = dict(bg="#2D2D2D", fg="#f5f5f5", insertbackground="#f5f5f5",
-                    relief=FLAT, font="Plus_Jakarta_Sans 10",
-                    highlightthickness=1, highlightbackground="#444444")
+        PAD = 28
 
-        Label(form, text="Title", **_lbl).pack(fill=X)
-        title_entry = Entry(form, **_ent)
-        title_entry.pack(fill=X, ipady=4, pady=(2, 12))
-
-        Label(form, text="Description", **_lbl).pack(fill=X)
-        desc_entry = Text(form, height=5, **_ent)
-        desc_entry.pack(fill=X, pady=(2, 0))
-
-        # ── preview thumbnail ─────────────────────────────────────────────
-        thumb_frame = Frame(self.wiki_view, bg=BG)
-        thumb_frame.pack(fill=X, padx=30, pady=(12, 0))
+        # ── preview card ──────────────────────────────────────────────────
+        prev_card = Frame(body, bg=CARD)
+        prev_card.pack(fill=X, padx=PAD, pady=(20, 0))
         thumb = self.current_image.copy().convert("RGB")
-        thumb.thumbnail((160, 160))
+        thumb.thumbnail((320, 320))
         _tk_thumb = ImageTk.PhotoImage(thumb)
-        Label(thumb_frame, image=_tk_thumb, bg=BG).pack(side=LEFT)
-        thumb_frame._tk_thumb = _tk_thumb  # keep reference
+        thumb_lbl = Label(prev_card, image=_tk_thumb, bg=CARD)
+        thumb_lbl.pack(pady=16)
+        thumb_lbl._tk_thumb = _tk_thumb
 
-        # ── status + button ───────────────────────────────────────────────
-        status = Label(self.wiki_view, text="", font="Plus_Jakarta_Sans 8",
-                       bg=BG, fg="#E06C75", wraplength=500, justify=LEFT)
-        status.pack(fill=X, padx=30, pady=(8, 0))
+        Frame(body, bg="#333333", height=1).pack(fill=X, padx=PAD)
 
-        btn_row = Frame(self.wiki_view, bg=BG)
-        btn_row.pack(fill=X, padx=30, pady=12)
+        # ── form card ─────────────────────────────────────────────────────
+        form = Frame(body, bg=CARD)
+        form.pack(fill=X, padx=PAD, pady=(0, 24))
+
+        _lbl = dict(bg=CARD, fg="#888888", font="Plus_Jakarta_Sans 8", anchor="w")
+        _ent = dict(bg="#1E1E1E", fg="#f5f5f5", insertbackground="#f5f5f5",
+                    relief=FLAT, font="Plus_Jakarta_Sans 10",
+                    highlightthickness=1, highlightbackground="#444444",
+                    highlightcolor="#6C6C9A")
+
+        Label(form, text="TITLE", **_lbl).pack(fill=X, padx=16, pady=(16, 2))
+        title_entry = Entry(form, **_ent)
+        title_entry.pack(fill=X, padx=16, ipady=6, pady=(0, 12))
+
+        Label(form, text="DESCRIPTION", **_lbl).pack(fill=X, padx=16, pady=(0, 2))
+        desc_entry = Text(form, height=5, **_ent)
+        desc_entry.pack(fill=X, padx=16, pady=(0, 16))
+
+        Frame(form, bg="#333333", height=1).pack(fill=X, padx=0)
+
+        status = Label(form, text="", font="Plus_Jakarta_Sans 8",
+                       bg=CARD, fg="#E06C75", wraplength=500, justify=LEFT)
+        status.pack(fill=X, padx=16, pady=(8, 0))
+
+        btn_row = Frame(form, bg=CARD)
+        btn_row.pack(fill=X, padx=16, pady=(8, 16))
 
         def _do_upload():
             title = title_entry.get().strip() or "untitled"
             desc  = desc_entry.get("1.0", END).strip()
             status.config(text="Uploading…", fg="#888888")
-            self.wiki_view.update_idletasks()
+            body.update_idletasks()
             err = self.community.upload_post(
                 self.current_image, title, self._applied_effects, desc)
             if err:
@@ -1211,7 +1582,7 @@ class App:
                 self._show_community_panel()
 
         self._btn(btn_row, "Upload", _do_upload).pack(side=LEFT, padx=(0, 8))
-        self._btn(btn_row, "Cancel", self._show_community_panel).pack(side=LEFT)
+        self._btn(btn_row, "Cancel", self._nav_back).pack(side=LEFT)
 
         title_entry.focus_set()
         self.wiki_view.bind("<Return>", lambda _: _do_upload())
@@ -1221,6 +1592,8 @@ class App:
         self.root.bind("<Escape>", lambda _: self._show_community_panel())
 
     def _open_base_wiki(self):
+        self._nav_push()
+        self._current_view = lambda: self._open_base_wiki()
         for widget in self.wiki_view.winfo_children():
             widget.destroy()
 
@@ -1246,25 +1619,93 @@ class App:
         self.root.bind("<Escape>", self._close_wiki_inline)
         self._log("Opened base wiki. Press Esc to close.", "info")
 
+    def _open_wiki_by_file(self, filename: str):
+        # check if it matches an effect wiki (e.g. "3.md", "03.md", "0003.md")
+        stem = filename.replace(".md", "")
+        for i, effect in enumerate(self.EFFECTS):
+            eid = str(effect["id"])
+            if eid == stem or eid == (stem.lstrip("0") or "0") or eid.zfill(4) == stem:
+                self._show_wiki_inline(i)
+                return
+
+        path = os.path.join("wiki", filename)
+        if not os.path.exists(path):
+            self._log(f"Wiki page not found: {filename}", "err")
+            return
+        self._nav_push()
+        self._current_view = lambda: self._open_wiki_by_file(filename)
+        for w in self.wiki_view.winfo_children():
+            w.destroy()
+        hdr = Frame(self.wiki_view, bg="#221F3A")
+        hdr.pack(fill=X)
+        self._btn(hdr, "← Back", self._nav_back,
+                  bg="#221F3A", fg="#888888",
+                  font="Plus_Jakarta_Sans 9", padx=12, pady=8).pack(side=LEFT)
+        Label(hdr, text=filename.replace(".md", "").replace("_", " "),
+              fg="#f5f5f5", bg="#221F3A", font="Plus_Jakarta_Sans 14 bold",
+              padx=8).pack(side=LEFT)
+        Frame(self.wiki_view, bg="#333333", height=1).pack(fill=X)
+        with open(path, "r") as f:
+            raw = f.read()
+        wiki_text = Text(self.wiki_view, bg="#2D2D2D", relief=FLAT, padx=12, pady=10)
+        wiki_text.pack(fill=BOTH, expand=1)
+        self._render_markdown(wiki_text, raw)
+        self._wiki_open = True
+        self.wiki_view.lift()
+        self.root.bind("<Escape>", self._close_wiki_inline)
+
+    def _open_post_by_short_id(self, short_id: str):
+        self._log(f"Looking up post <{short_id}>…", "info")
+        import threading
+        def _fetch():
+            post = self.community.fetch_post_by_short_id(short_id)
+            if post:
+                self.root.after(0, lambda: self._open_post_view(post, None))
+            else:
+                self.root.after(0, lambda: self._log(f"No post found with ID <{short_id}>.", "err"))
+        threading.Thread(target=_fetch, daemon=True).start()
+
     # --- profile ---
 
     _PROFILE_FILE = "profile.json"
-    _PROFILE_PIC  = "profile_pic.jpg"
+    _PROFILE_PIC  = "profile_pic.jpg"  # base name; actual = profile_pic_<username>.jpg
+
+    def _profile_pic_path(self) -> str:
+        username = self.community.username or "__guest__"
+        return f"profile_pic_{username}.jpg"
 
     def _profile_load(self) -> dict:
-        if not os.path.exists(self._PROFILE_FILE):
-            return {"bio": ""}
+        username = self.community.username or "__guest__"
         try:
+            if not os.path.exists(self._PROFILE_FILE):
+                return {"bio": ""}
             with open(self._PROFILE_FILE) as f:
-                return json.load(f)
+                all_data = json.load(f)
+            # migrate old flat format {"bio": "..."} → {username: {"bio": "..."}}
+            if "bio" in all_data and not any(isinstance(v, dict) for v in all_data.values()):
+                all_data = {username: all_data}
+                with open(self._PROFILE_FILE, "w") as f:
+                    json.dump(all_data, f, indent=2)
+            return all_data.get(username, {"bio": ""})
         except Exception:
             return {"bio": ""}
 
     def _profile_save(self, data: dict):
+        username = self.community.username or "__guest__"
+        try:
+            all_data = {}
+            if os.path.exists(self._PROFILE_FILE):
+                with open(self._PROFILE_FILE) as f:
+                    all_data = json.load(f)
+        except Exception:
+            all_data = {}
+        all_data[username] = data
         with open(self._PROFILE_FILE, "w") as f:
-            json.dump(data, f, indent=2)
+            json.dump(all_data, f, indent=2)
 
     def _open_profile(self):
+        self._nav_stack.clear()
+        self._current_view = lambda: self._open_profile()
         for w in self.wiki_view.winfo_children():
             w.destroy()
 
@@ -1307,9 +1748,7 @@ class App:
         _cw = canvas.create_window((0, 0), window=body, anchor="nw")
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(_cw, width=e.width))
         body.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Up>",   lambda _: canvas.yview_scroll(-1, "units"))
-        canvas.bind("<Down>", lambda _: canvas.yview_scroll( 1, "units"))
-        canvas.focus_set()
+        self._bind_scroll(canvas)
 
         # ── profile card ──────────────────────────────────────────────────
         card = Frame(body, bg="#242424")
@@ -1354,8 +1793,9 @@ class App:
             return ImageTk.PhotoImage(img)
 
         def _load_pic():
-            if os.path.exists(self._PROFILE_PIC):
-                img = Image.open(self._PROFILE_PIC).convert("RGB").resize((80, 80))
+            pic_path = self._profile_pic_path()
+            if os.path.exists(pic_path):
+                img = Image.open(pic_path).convert("RGB").resize((80, 80))
                 tk_img = ImageTk.PhotoImage(img)
             else:
                 color = _avatar_colors[hash(username) % len(_avatar_colors)]
@@ -1371,13 +1811,12 @@ class App:
             if not path:
                 return
             img = Image.open(path).convert("RGB")
-            # crop square from center
             w, h = img.size
             m = min(w, h)
             img = img.crop(((w - m) // 2, (h - m) // 2,
                              (w + m) // 2, (h + m) // 2))
             img = img.resize((200, 200))
-            img.save(self._PROFILE_PIC, format="JPEG", quality=92)
+            img.save(self._profile_pic_path(), format="JPEG", quality=92)
             _load_pic()
 
         self._profile_pic_label.bind("<Button-1>", lambda _: _change_pic())
@@ -1462,7 +1901,8 @@ class App:
     def _open_user_profile(self, username: str):
         """Read-only profile view for any user, opened from a post."""
         import threading, urllib.request
-
+        self._nav_push()
+        self._current_view = lambda: self._open_user_profile(username)
         for w in self.wiki_view.winfo_children():
             w.destroy()
 
@@ -1475,7 +1915,7 @@ class App:
         # banner
         hdr = Frame(self.wiki_view, bg="#221F3A")
         hdr.pack(fill=X)
-        self._btn(hdr, "← Back", self._show_community_panel,
+        self._btn(hdr, "← Back", self._nav_back,
                   bg="#221F3A", fg="#888888",
                   font="Plus_Jakarta_Sans 9", padx=12, pady=8).pack(side=LEFT)
         Frame(self.wiki_view, bg="#333333", height=1).pack(fill=X)
@@ -1492,9 +1932,7 @@ class App:
         _cw = canvas.create_window((0, 0), window=body, anchor="nw")
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(_cw, width=e.width))
         body.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Up>",   lambda _: canvas.yview_scroll(-1, "units"))
-        canvas.bind("<Down>", lambda _: canvas.yview_scroll( 1, "units"))
-        canvas.focus_set()
+        self._bind_scroll(canvas)
 
         # avatar + username card
         card = Frame(body, bg="#242424")
@@ -1524,9 +1962,19 @@ class App:
         av_lbl.image = _tk_av
         av_lbl.pack(side=LEFT, padx=16, pady=16)
 
-        Label(card, text=username, font="Plus_Jakarta_Sans 16 bold",
-              bg="#242424", fg="#f5f5f5", anchor="w").pack(
-              side=LEFT, padx=(0, 16), pady=16)
+        info = Frame(card, bg="#242424")
+        info.pack(side=LEFT, fill=X, expand=1, padx=(0, 16), pady=16)
+        Label(info, text=username, font="Plus_Jakarta_Sans 16 bold",
+              bg="#242424", fg="#f5f5f5", anchor="w").pack(fill=X)
+
+        # bio — show own bio from local storage, blank for others
+        _bio = ""
+        if username == self.community.username:
+            _bio = self._profile_load().get("bio", "")
+        if _bio:
+            Label(info, text=_bio,
+                  font="Plus_Jakarta_Sans 9 italic", bg="#242424", fg="#888888",
+                  anchor="w", justify=LEFT, wraplength=400).pack(fill=X, pady=(4, 0))
 
         # posts
         Frame(body, bg="#2A2A2A", height=1).pack(fill=X, padx=20)
@@ -1616,6 +2064,8 @@ class App:
         self._log(f"Saved to workspace ({filename}).", "ok")
 
     def _open_workspace(self):
+        self._nav_stack.clear()
+        self._current_view = lambda: self._open_workspace()
         for w in self.wiki_view.winfo_children():
             w.destroy()
 
@@ -1648,9 +2098,7 @@ class App:
                 canvas.configure(scrollregion=(0, 0, bb[2], bb[3]))
                 canvas.yview_moveto(0)
         gallery.bind("<Configure>", _update_scrollregion)
-        canvas.bind("<Up>",   lambda _: canvas.yview_scroll(-1, "units") if canvas.yview()[0] > 0 else None)
-        canvas.bind("<Down>", lambda _: canvas.yview_scroll( 1, "units"))
-        canvas.focus_set()
+        self._bind_scroll(canvas)
 
         if not entries:
             Label(gallery, text="No saved images yet.\nUse  to save the current image.",
@@ -1694,7 +2142,7 @@ class App:
         # banner with back + upload button on right
         hdr = Frame(self.wiki_view, bg="#221F3A")
         hdr.pack(fill=X)
-        self._btn(hdr, "← Back", self._open_workspace,
+        self._btn(hdr, "← Back", self._nav_back,
                   bg="#221F3A", fg="#888888",
                   font="Plus_Jakarta_Sans 9", padx=12, pady=8).pack(side=LEFT)
         self._btn(hdr, "↑  Upload", self._upload_post,
